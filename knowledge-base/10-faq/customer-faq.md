@@ -29,7 +29,7 @@ Reviews are submitted for moderation and become public only once published.
 
 ## How do I start a return?
 
-Contact `hello@sidaiartistry.com` within 14 days of delivery with your order number and reason. Review the return conditions first.
+Contact support within 14 days of delivery with your order number and reason. Review the return conditions first.
 
 ## Related articles
 

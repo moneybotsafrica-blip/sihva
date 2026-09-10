@@ -13,15 +13,15 @@ confidence: medium
 
 ## Returns
 
-The public returns page says customers should contact Sidai Artistry within 14 days of delivery. Items must be unworn, unused, and in original packaging. Custom, personalised, hygiene-sensitive, and final-sale pieces are normally non-returnable unless faulty. To start a return, the page directs customers to email `hello@sidaiartistry.com` with the order number and reason.
+The public returns page says customers should contact Shiva Softwares within 14 days of delivery. Items must be unworn, unused, and in original packaging. Custom, personalised, hygiene-sensitive, and final-sale pieces are normally non-returnable unless faulty. To start a return, the page directs customers to email support with the order number and reason.
 
 ## Privacy
 
-The public policy says contact, delivery, account, and transaction information is used for fulfilment, support, and legal obligations. It says access is restricted, passwords are hashed, and payment details are processed by payment providers rather than stored by Sidai Artistry. Requests for eligible access, correction, or deletion are directed to `hello@sidaiartistry.com`.
+The public policy says contact, delivery, account, and transaction information is used for fulfilment, support, and legal obligations. It says access is restricted, passwords are hashed, and payment details are processed by payment providers rather than stored by Shiva Softwares. Requests for eligible access, correction, or deletion are directed to support.
 
 ## Terms
 
-Availability, price, stock, colour, and handmade variation are confirmed by the server when an order is placed. An order is accepted once payment is confirmed. Sidai Artistry may contact the customer about delivery, availability, or fraud checks.
+Availability, price, stock, colour, and handmade variation are confirmed by the server when an order is placed. An order is accepted once payment is confirmed. Shiva Softwares may contact the customer about delivery, availability, or fraud checks.
 
 ## Needs confirmation
 

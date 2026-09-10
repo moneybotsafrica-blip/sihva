@@ -1,7 +1,6 @@
 from typing import Optional, Any
 from dataclasses import dataclass
 from fastapi import Request, HTTPException, status
-from strawberry.types import Info
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 import structlog
@@ -40,16 +39,6 @@ class AuthContext:
         In production, this would validate against your auth provider.
         """
         try:
-            # Handle mock tokens for development
-            if token == "mock_token_customer":
-                return User(id="cust_001", email="customer@example.com", role="customer")
-            elif token == "mock_token_staff":
-                return User(id="staff_001", email="staff@example.com", role="staff")
-            elif token == "mock_token_staff_002":
-                return User(id="staff_002", email="sarah.engineer@shiva.com", role="staff")
-            elif token == "mock_token_staff_003":
-                return User(id="staff_003", email="mike.lead@shiva.com", role="staff")
-            
             payload = jwt.decode(
                 token,
                 settings.jwt_secret_key,
@@ -161,54 +150,3 @@ class AuthMiddleware:
             await self.app(scope, receive, send)
         else:
             await self.app(scope, receive, send)
-
-
-def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """Verify a password against a hash."""
-    return pwd_context.verify(plain_password, hashed_password)
-
-
-def get_password_hash(password: str) -> str:
-    """Hash a password."""
-    return pwd_context.hash(password)
-
-
-# Mock user database for development
-MOCK_USERS = {
-    "customer@example.com": {
-        "id": "cust_123",
-        "email": "customer@example.com",
-        "role": "customer",
-        "password": "pass123",
-    },
-    "staff@example.com": {
-        "id": "staff_456",
-        "email": "staff@example.com",
-        "role": "staff",
-        "password": "pass123",
-    },
-    "developer@example.com": {
-        "id": "dev_789",
-        "email": "developer@example.com",
-        "role": "developer",
-        "password": "pass123",
-    },
-}
-
-
-async def authenticate_user(email: str, password: str) -> Optional[User]:
-    """Authenticate a user with email and password."""
-    user_data = MOCK_USERS.get(email)
-    
-    if not user_data:
-        return None
-    
-    # For development, use simple password check
-    if password != "pass123":
-        return None
-    
-    return User(
-        id=user_data["id"],
-        email=user_data["email"],
-        role=user_data["role"],
-    )

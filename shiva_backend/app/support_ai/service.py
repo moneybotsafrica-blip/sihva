@@ -1,13 +1,16 @@
-from typing import Optional, List, Dict, Any, TYPE_CHECKING
+from typing import Optional, List, Dict, Any, TYPE_CHECKING, AsyncIterator
 from datetime import datetime
 import structlog
+from functools import lru_cache
 
 from app.clients.qdrant_client import QdrantClientInterface, SearchResult
 from app.clients.groq_client import GroqClientInterface, ChatMessage, LLMResponse
-from app.clients.customer_api import CustomerApiClientInterface, CustomerAccount
 from app.ticket_center.service import TicketCenterService
 from app.config import settings
 from app.db.models import MessageSender
+from app.support_ai.agents import AgentOrchestrator
+from app.common.prompts import LANGUAGE_POLICY
+from app.common.language_check import enforce_language_policy
 
 if TYPE_CHECKING:
     from app.db.models import TicketMessage
@@ -22,13 +25,191 @@ class SupportAIService:
         self,
         qdrant_client: QdrantClientInterface,
         groq_client: GroqClientInterface,
-        customer_api_client: CustomerApiClientInterface,
         confidence_threshold: Optional[float] = None,
+        complex_task_client: Optional[GroqClientInterface] = None,
     ):
         self.qdrant_client = qdrant_client
         self.groq_client = groq_client
-        self.customer_api_client = customer_api_client
+        self.complex_task_client = complex_task_client  # Optional: Gemini for complex tasks
         self.confidence_threshold = confidence_threshold or settings.support_ai_confidence_threshold
+        self.agent_orchestrator = AgentOrchestrator(groq_client)
+
+    def _is_greeting_or_conversational(self, message: str) -> bool:
+        """
+        Check if the message is a greeting or conversational without a real issue.
+        """
+        greeting_patterns = [
+            "hello", "hi", "hey", "good morning", "good afternoon", "good evening",
+            "how are you", "how's it going", "what's up", "thanks", "thank you",
+            "bye", "goodbye", "see you", "ok", "okay", "sure", "alright", "cool"
+        ]
+        
+        message_lower = message.lower().strip()
+        
+        # Only treat a message as conversational when it contains no issue details.
+        for pattern in greeting_patterns:
+            if message_lower == pattern:
+                return True
+        
+        # Check if message is very short (likely conversational)
+        if len(message.split()) <= 2:
+            return True
+            
+        return False
+
+    async def _generate_conversation_title(
+        self,
+        message: str,
+        conversation_history: List,
+        client: Optional[GroqClientInterface] = None,
+    ) -> Optional[str]:
+        """
+        Generate a short, factual conversation title based on the customer's issue.
+        Returns None for greetings or conversational messages.
+        """
+        # Skip title generation for greetings
+        if self._is_greeting_or_conversational(message):
+            return None
+        
+        # Preserve an existing title when the caller carries it in the history.
+        for history_item in conversation_history or []:
+            if isinstance(history_item, dict):
+                existing_title = history_item.get("analysis", {}).get("conversation_title")
+                if existing_title:
+                    return existing_title
+
+        # Title the first meaningful customer message so follow-ups do not rename it.
+        customer_messages = []
+        for history_item in conversation_history or []:
+            role = history_item.get("role") if isinstance(history_item, dict) else getattr(history_item, "role", None)
+            content = history_item.get("content", "") if isinstance(history_item, dict) else getattr(history_item, "content", "")
+            if role in (None, "user") and content and not self._is_greeting_or_conversational(content):
+                customer_messages.append(content)
+        issue_message = customer_messages[0] if customer_messages else message
+        transcript = []
+        for history_item in conversation_history or []:
+            if isinstance(history_item, dict):
+                role = history_item.get("role", "unknown")
+                content = history_item.get("content", "")
+            else:
+                role = getattr(history_item, "role", None)
+                if role is None and hasattr(history_item, "sender"):
+                    role = str(history_item.sender).split(".")[-1].lower()
+                content = getattr(history_item, "content", "")
+            if content:
+                transcript.append(f"{role}: {content}")
+        title_context = (
+            f"Initial customer issue: {issue_message}\n"
+            f"Conversation flow:\n{chr(10).join(transcript)}\n"
+            f"Latest customer message: {message}\n"
+        )
+        
+        title_prompt = f"""Understand the meaning and progression of this support conversation, then generate a short, factual title based on the underlying customer issue.
+
+Context:
+{title_context}
+
+Rules:
+- 3-10 words maximum
+- Maximum 120 characters
+- No markdown, quotes, or emojis
+- No customer names, passwords, tokens, or sensitive information
+- Focus on the actual technical/business issue
+- Use the conversation flow to resolve references such as "it", "that", or "still failing"
+- Do not title the conversation after a greeting, request for a human, or generic follow-up
+- Examples: "Product creation error 500", "Unable to log in", "Payment API timeout"
+
+Return ONLY the title, nothing else. If this is just a greeting or conversational message, return empty string."""
+
+        try:
+            title_client = client or self.groq_client
+            response = await title_client.chat_completion(
+                messages=[ChatMessage(role="user", content=title_prompt)],
+                max_tokens=50,
+            )
+            
+            title = " ".join(response.content.strip().split())
+            
+            # Validate title length and content
+            if not title or len(title) > 120 or not 3 <= len(title.split()) <= 10:
+                return None
+                
+            # Clean up any quotes or markdown
+            title = title.replace('"', '').replace("'", '').replace('*', '').replace('#', '').replace('`', '').strip()
+            
+            return title if title else None
+            
+        except Exception as e:
+            logger.warning("Failed to generate conversation title", error=str(e))
+            return None
+
+    def _requires_product_selection(self, message: str, conversation_history: List) -> bool:
+        """Return whether accurate troubleshooting needs an entitled product choice."""
+        context = " ".join(
+            [message]
+            + [
+                item.get("content", "") if isinstance(item, dict) else getattr(item, "content", "")
+                for item in conversation_history or []
+            ]
+        ).lower()
+        product_specific_indicators = [
+            "401", "403", "404", "500", "error", "api", "integration", "webhook",
+            "product", "checkout", "cart", "order", "payment", "shipping", "inventory",
+            "catalog", "store", "shop", "purchase", "buy", "plugin", "module", "feature",
+        ]
+        general_indicators = [
+            "how do i contact", "contact support", "reach support", "talk to support",
+            "what is shiva", "about shiva", "shiva support",
+        ]
+        return (
+            any(indicator in context for indicator in product_specific_indicators)
+            and not any(indicator in context for indicator in general_indicators)
+        )
+
+    def _is_explicit_agent_request(self, message: str) -> bool:
+        """Detect a direct request for human support that must bypass product gating."""
+        agent_request_indicators = [
+            "talk to agent", "speak to agent", "speak to staff", "talk to staff",
+            "human agent", "real person", "talk to human", "speak to human",
+            "agent please", "human please", "real agent", "live agent",
+            "i want to speak to a person", "i need to talk to someone",
+            "transfer me", "escalate this",
+        ]
+        message_lower = message.lower()
+        return any(indicator in message_lower for indicator in agent_request_indicators)
+
+    async def _product_selection_response(self, message: str, conversation_history: List) -> str:
+        """Explain the product requirement without exposing or inventing product choices."""
+        try:
+            messages = [
+                ChatMessage(
+                    role="system",
+                    content=(
+                        "You are a helpful Shiva Support assistant. Explain in clean Markdown "
+                        "that the customer's product is needed to provide accurate troubleshooting. "
+                        "Do not name, list, guess, or invent products. Ask them to select a product "
+                        "from the options shown by the client. Use the conversation history and do "
+                        "not repeat steps already tried."
+                    ) + LANGUAGE_POLICY,
+                )
+            ]
+            messages.extend(
+                self.agent_orchestrator.agents[0]._build_conversation_messages(
+                    conversation_history, message
+                )
+                if conversation_history
+                else [ChatMessage(role="user", content=message)]
+            )
+            response = await self.groq_client.chat_completion(
+                messages=messages, temperature=0.7, max_tokens=400, reasoning_effort="low"
+            )
+            return enforce_language_policy(response.content, message)
+        except Exception as e:
+            logger.error("Failed to generate product selection response", error=str(e))
+            return (
+                "To troubleshoot this accurately, I need to know which Shiva product you are "
+                "using. Please select your product from the options provided."
+            )
 
     async def handle_customer_message(
         self,
@@ -38,17 +219,30 @@ class SupportAIService:
         ticket_service: Optional[TicketCenterService],
         is_agent_request: bool = False,
         conversation_history: Optional[List] = None,
+        customer_data: Optional[Dict[str, Any]] = None,
+        product_context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Handle a customer message through the Support AI pipeline.
 
         Process:
         1. Retrieve conversation history (or use provided)
-        2. Retrieve customer account info
-        3. Search knowledge base for relevant context
-        4. Check if issue is complex (if agent request)
-        5. Generate response using Groq LLM
-        6. Based on confidence and complexity, either auto-respond or queue for staff
+        2. Use customer data provided by frontend (eliminates external API dependency)
+        3. Use product context if provided for product-specific guidance
+        4. Search knowledge base for relevant context
+        5. Check if issue is complex (if agent request)
+        6. Generate response using Groq LLM
+        7. Based on confidence and complexity, either auto-respond or queue for staff
+
+        Args:
+            customer_data: Dict containing customer information provided by frontend
+                         (e.g., name, email, account_type, subscription_status, etc.)
+            product_context: Dict containing product-specific information:
+                          - product_id: str
+                          - product_name: str
+                          - enabled_modules: List[str]
+                          - client_entitled: bool
+                          - relevant_knowledge_articles: List[str]
 
         Returns:
             Dict with keys: action, response, confidence, should_queue, complexity_analysis
@@ -60,168 +254,1135 @@ class SupportAIService:
             elif conversation_history is None:
                 conversation_history = []
             else:
-                # Convert conversation history to the expected format if it's a list of dicts
+                # Convert conversation history to ChatMessage format if it's a list of dicts (from Shiva Support)
                 if conversation_history and isinstance(conversation_history[0], dict):
-                    # Convert dict format to object format expected by the system
-                    from collections import namedtuple
-                    TicketMessageLike = namedtuple('TicketMessageLike', ['id', 'ticket_id', 'sender', 'content', 'attachments', 'created_at'])
+                    # Map Shiva Support role format to LLM role format
+                    role_mapping = {
+                        "user": "user",
+                        "assistant": "assistant",
+                        "system": "system"
+                    }
                     conversation_history = [
-                        TicketMessageLike(
-                            id=msg.get('id', 'temp_id'),
-                            ticket_id='temp_ticket',
-                            sender=msg.get('sender', 'customer'),
-                            content=msg.get('content', ''),
-                            attachments=msg.get('attachments'),
-                            created_at=datetime.fromisoformat(msg.get('created_at', datetime.now().isoformat())) if msg.get('created_at') else datetime.now()
+                        ChatMessage(
+                            role=role_mapping.get(msg.get("role", "user"), "user"),
+                            content=msg.get("content", "")
                         )
                         for msg in conversation_history
                     ]
+                elif conversation_history and hasattr(conversation_history[0], 'sender'):
+                    # Already in database object format, agents will handle conversion
+                    pass
+                elif conversation_history and hasattr(conversation_history[0], 'role'):
+                    # Already in ChatMessage format from Shiva Support - keep as is
+                    pass
+                elif not conversation_history:
+                    # Empty conversation history is valid (first message)
+                    conversation_history = []
+                else:
+                    # Unknown format - log warning but don't discard
+                    logger.warning(
+                        "Unknown conversation history format",
+                        history_type=type(conversation_history[0]) if conversation_history else None,
+                        history_length=len(conversation_history) if conversation_history else 0
+                    )
+                    # Try to preserve the history anyway
+                    conversation_history = list(conversation_history)
 
-            # Step 2: Get customer account info
-            try:
-                customer_account = await self.customer_api_client.get_account(customer_id)
-            except Exception as e:
-                logger.warning(f"Failed to get customer account: {e}")
-                customer_account = None
+            # Determine if this is a follow-up message (customer has received AI help before)
+            if conversation_history:
+                # Check if history contains ChatMessage format (role/content) or database objects (sender)
+                if hasattr(conversation_history[0], 'role'):
+                    # ChatMessage format from Shiva Support
+                    previous_ai_attempts = [msg for msg in conversation_history if msg.role == "assistant"]
+                elif hasattr(conversation_history[0], 'sender'):
+                    # Database object format
+                    previous_ai_attempts = [
+                        msg for msg in conversation_history
+                        if hasattr(msg, 'sender') and msg.sender == MessageSender.SUPPORT_AI
+                    ]
+                else:
+                    # Unknown format - assume not follow-up
+                    previous_ai_attempts = []
+                is_follow_up = len(previous_ai_attempts) > 0
+            else:
+                is_follow_up = False
 
-            # Step 3: Search knowledge base
-            kb_context = await self._retrieve_knowledge_base_context(message)
+            # Initialize complexity_analysis early (needed for early returns)
+            complexity_analysis = {
+                "is_complex": False,
+                "complexity_score": 0.0,
+                "reasons": []
+            }
 
-            # Step 4: Check every request for complexity.  A customer should not
-            # have to explicitly request an agent before a clearly complex issue
-            # is routed to staff.
-            complexity_analysis = await self._analyze_complexity(
-                message=message,
-                kb_context=kb_context,
-                conversation_history=conversation_history,
-            )
+            # Step 2: Check for ticket inquiries VERY EARLY in the flow
+            # KEY PRINCIPLE: Understand the problem before creating any ticket
+            # Ticket-related inquiries (should be handled conversationally, not with instructions)
+            ticket_inquiry = [
+                "raise a ticket", "raise me a ticket", "raise for me a ticket", "create a ticket", "open a ticket", "submit a ticket",
+                "ticket for me", "raise ticket", "create ticket", "open ticket", "i need a ticket", "want a ticket",
+                "get a ticket", "need ticket", "want ticket", "i want to raise a ticket", "i want to create a ticket",
+                "can you create a ticket", "please create a ticket", "help me create a ticket",
+                "file a ticket", "file ticket", "log a ticket", "log ticket", "escalate this to a ticket", "escalate to ticket"
+            ]
+            has_ticket_inquiry = any(indicator in message.lower() for indicator in ticket_inquiry)
 
-            # Step 5: Generate response
-            response = await self._generate_response(
-                message=message,
-                conversation_history=conversation_history,
-                customer_account=customer_account,
-                kb_context=kb_context,
-                is_agent_request=is_agent_request,
-            )
+            # Check if message contains actual problem description vs just requesting a ticket
+            problem_description_indicators = [
+                "error", "issue", "problem", "not working", "doesn't work", "broken", "fail", "failed",
+                "can't", "unable", "stuck", "help", "question", "how", "what", "why", "when"
+            ]
+            has_problem_description = any(indicator in message.lower() for indicator in problem_description_indicators)
 
-            # Step 6: Validate solution completeness
-            solution_validation = self._validate_solution_completeness(
-                response.content, 
-                kb_context, 
-                message
-            )
-            
-            # Step 7: Determine action based on confidence, complexity, and solution quality
-            should_queue = False
-            action = "auto_resolve"
+            # Typed human requests must use the same immediate escalation path as the UI button.
+            if self._is_explicit_agent_request(message):
+                is_agent_request = True
 
-            # Check for out-of-scope messages using Groq AI classification
-            is_out_of_scope = await self._is_out_of_scope_groq(message)
-            if is_out_of_scope:
-                logger.info("Out-of-scope message detected - will provide scope-appropriate response")
-                # Don't create tickets for out-of-scope messages
+            # CRITICAL: Detect gibberish/random keystrokes - NEVER create tickets for these
+            def is_gibberish(text: str) -> bool:
+                """Detect if text is random keystrokes/gibberish."""
+                if len(text) < 10:
+                    return False
+                # Check for excessive consecutive consonants or repetitive patterns
+                words = text.split()
+                if not words:
+                    return False
+                # Check if most words are very long with many consonants (indicative of random typing)
+                long_gibberish_words = [w for w in words if len(w) > 8 and sum(1 for c in w.lower() if c in 'bcdfghjklmnpqrstvwxyz') > len(w) * 0.8]
+                return len(long_gibberish_words) > len(words) * 0.5
+
+            is_gibberish_message = is_gibberish(message)
+
+            if is_gibberish_message:
+                logger.info(
+                    "Gibberish/random keystrokes detected - will not create ticket",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
                 should_queue = False
                 action = "out_of_scope"
+
+                # Use Groq to generate appropriate response for gibberish
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI. The user sent a message that appears to be random keystrokes or gibberish. Respond politely and ask them what they need help with. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    gibberish_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = gibberish_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                except Exception as e:
+                    logger.error("Failed to generate gibberish response", error=str(e))
+                    response_text = "It looks like that might have been a typo. How can I help you today?"
+
+                return {
+                    "action": action,
+                    "response": response_text,
+                    "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "kb_similarity_score": None,
+                    "kb_article_ids": None,
+                    "metadata": {},
+                    "needs_product_selection": False,
+                    "needs_ticket": False,
+                }
+
+            # Check for simple greetings - do this BEFORE vague issue detection
+            simple_greetings = ["hello", "hi", "hey", "good morning", "good afternoon", "good evening"]
+            is_simple_greeting = any(indicator in message.lower().strip() == indicator for indicator in simple_greetings)
+            
+            if is_simple_greeting and len(message.split()) <= 3:
+                # Just a simple greeting, respond naturally without asking for details
+                logger.info(
+                    "Simple greeting detected - will respond naturally",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                should_queue = False
+                action = "auto_resolve"
                 
-                # Generate a helpful out-of-scope response
-                out_of_scope_response = "I am here to help with any Shiva-related questions or issues you might have—feel free to ask about your account, service, payments, or anything else Shivasoftwares! What can I assist with today?"
+                # Use Groq to generate natural greeting response
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. Respond naturally and friendly to the user's greeting. Be conversational and ready to help. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    greeting_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.8,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = greeting_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                except Exception as e:
+                    logger.error("Failed to generate greeting response", error=str(e))
+                    response_text = "Hello! I'm here to help you with any Shiva Softwares questions or issues. What can I assist you with today?"
                 
                 return {
                     "action": action,
-                    "response": out_of_scope_response,
-                    "confidence": 0.0,
+                    "response": response_text,
+                    "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "kb_similarity_score": None,
+                    "kb_article_ids": None,
+                    "metadata": {},
+                    "needs_product_selection": False,
+                    "needs_ticket": False,
+                }
+            
+            # Check for informational questions about raising tickets
+            # Provide a fixed response without inventing portals, emails, or phone numbers
+            ticket_info_indicators = [
+                "how do i raise a ticket",
+                "how do i create a ticket",
+                "how to raise a ticket",
+                "how to create a ticket",
+                "how can i raise a ticket",
+                "how can i create a ticket",
+                "where do i raise a ticket",
+                "where can i raise a ticket"
+            ]
+            
+            is_ticket_info_question = any(indicator in message.lower() for indicator in ticket_info_indicators)
+            
+            if is_ticket_info_question:
+                logger.info(
+                    "Ticket information question detected - using Groq for response",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                should_queue = False
+                action = "auto_resolve"
+                
+                # Use Groq to generate helpful response about tickets
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The user is asking about how to create support tickets. Explain that they should describe their issue and you'll help directly, and only create tickets for complex issues you can't resolve. Be helpful and solution-oriented. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    ticket_info_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = ticket_info_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                except Exception as e:
+                    logger.error("Failed to generate ticket info response", error=str(e))
+                    response_text = "If you're experiencing an issue, just describe what's happening and I'll help you directly. For complex issues, I can create a support ticket. What problem are you facing?"
+                
+                return {
+                    "action": action,
+                    "response": response_text,
+                    "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "kb_similarity_score": None,
+                    "kb_article_ids": None,
+                    "metadata": {},
+                    "needs_product_selection": False,
+                    "needs_ticket": False,
+                }
+            
+            # Skip complexity analysis for simple cases to improve speed
+            skip_complexity_analysis = False
+
+            # Check for vague technical issues that need more information
+            vague_technical_indicators = [
+                "not working", "doesn't work", "broken", "error", "issue", "problem",
+                "can't access", "unable to", "fail", "failed", "having trouble"
+            ]
+            has_vague_technical_issue = any(indicator in message.lower() for indicator in vague_technical_indicators)
+
+            # Check if message is too short or lacks details
+            message_too_short = len(message.split()) < 5
+            lacks_details = not any([
+                "error" in message.lower(),
+                "message" in message.lower(),
+                "screen" in message.lower(),
+                "page" in message.lower(),
+                "button" in message.lower(),
+                "step" in message.lower(),
+                "when" in message.lower(),
+                "after" in message.lower()
+            ])
+
+            logger.info(
+                "Ticket inquiry check",
+                message=message,
+                message_lower=message.lower(),
+                has_ticket_inquiry=has_ticket_inquiry,
+                is_follow_up=is_follow_up,
+                ticket_inquiry_indicators=ticket_inquiry,
+            )
+
+            # EXPLICIT TICKET REQUEST: Detect direct requests to raise/open/create a ticket
+            # This must be checked BEFORE the general ticket inquiry check to distinguish
+            # between "raise a ticket" (command) vs "how do I raise a ticket" (question)
+            ticket_request_indicators = [
+                "raise a ticket", "please raise a ticket", "raise ticket for me",
+                "open a ticket", "please open a ticket", "open ticket for me",
+                "create a ticket", "please create a ticket", "create ticket for me",
+                "file a ticket", "please file a ticket", "file ticket for me",
+                "submit a ticket", "please submit a ticket", "submit ticket for me",
+                "log a ticket", "please log a ticket", "log ticket for me",
+                "escalate to a ticket", "escalate this to a ticket", "make a ticket",
+                "i need a ticket", "i want a ticket", "can you raise a ticket",
+                "can you open a ticket", "can you create a ticket", "need ticket created"
+            ]
+            is_direct_ticket_request = any(indicator in message.lower() for indicator in ticket_request_indicators)
+            
+            if is_direct_ticket_request:
+                logger.info(
+                    "Direct ticket request detected - escalating directly",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                should_escalate = True
+                escalation_reason = "explicit_ticket_request"
+                should_queue = True
+                action = "queue_for_staff"
+                
+                # Generate a response acknowledging the ticket creation with context
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The customer has explicitly requested a support ticket. Acknowledge their request and confirm that you're escalating it to the support team. If there is conversation history, read it carefully to understand the context before responding - acknowledge the issue they've been discussing." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    ticket_request_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = ticket_request_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                    if not any(term in response_text.lower() for term in ("ticket", "escalat")):
+                        response_text = "I understand you'd like a support ticket created. I'm escalating your request to our support team right away."
+                except Exception as e:
+                    logger.error("Failed to generate ticket request response", error=str(e))
+                    response_text = "I understand you'd like a support ticket created. I'm escalating this to our support team right away."
+                
+                return {
+                    "action": action,
+                    "response": response_text,
+                    "confidence": 1.0,
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "escalation_reason": escalation_reason,
+                }
+
+            # Check for ticket inquiries - handle conversationally by asking for the issue
+            # KEY PRINCIPLE: Never create a ticket without understanding the problem first
+            if has_ticket_inquiry and not is_follow_up:
+                # Check if this is a general "how to" question about tickets (informational)
+                how_to_ticket_questions = [
+                    "how do i raise a ticket", "how to raise a ticket", "how to create a ticket",
+                    "how do i create a ticket", "how to submit a ticket", "how do i submit a ticket",
+                    "what is a ticket", "what is a support ticket", "how does ticket work",
+                    "how do tickets work", "ticket process", "ticket system", "raise ticket",
+                    "create ticket", "open ticket", "submit ticket"
+                ]
+                is_how_to_question = any(question in message.lower() for question in how_to_ticket_questions)
+                
+                if is_how_to_question:
+                    # This is just an informational question about the ticket process
+                    # Let the AI answer it naturally without creating a ticket
+                    logger.info(
+                        "Informational question about ticket process - will answer without creating ticket",
+                        ticket_id=ticket_id,
+                        message=message,
+                    )
+                    should_queue = False
+                    action = "auto_resolve"
+                    
+                    # Let the agent system handle this as a normal question
+                    # Don't return early - let the agent provide the answer
+                elif not has_problem_description:
+                    # Customer asked for a ticket but didn't describe the problem
+                    logger.info(
+                        "Ticket inquiry without problem description - asking for issue details first",
+                        ticket_id=ticket_id,
+                        message=message,
+                        has_ticket_inquiry=has_ticket_inquiry,
+                        has_problem_description=has_problem_description,
+                    )
+                    should_queue = False
+                    action = "gather_issue_info"
+
+                    # Generate conversational response asking for the issue
+                    # Use Groq to generate conversational response asking for the issue
+                    try:
+                        # Build messages with conversation history for context
+                        messages = [
+                            ChatMessage(
+                                role="system",
+                                content="You are a helpful customer support AI for Shiva Softwares. The customer asked to create a ticket but didn't describe their problem. Respond conversationally, explain that you can help solve their issue directly instead of creating a ticket, and ask them to describe what problem they're experiencing. Be friendly and solution-oriented. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                            )
+                        ]
+                        
+                        # Add conversation history if available
+                        if conversation_history:
+                            conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                            messages.extend(conversation_messages)
+                        else:
+                            messages.append(ChatMessage(role="user", content=message))
+                        
+                        ticket_inquiry_response_obj = await self.groq_client.chat_completion(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=400,
+                            reasoning_effort="low",
+                        )
+                        ticket_inquiry_response = ticket_inquiry_response_obj.content
+                        # Enforce language policy
+                        ticket_inquiry_response = enforce_language_policy(ticket_inquiry_response, message)
+                    except Exception as e:
+                        logger.error("Failed to generate ticket inquiry response", error=str(e))
+                        ticket_inquiry_response = "I can help you with that! Instead of creating a ticket right away, let me try to solve your issue directly. What problem are you experiencing?"
+
+                    return {
+                        "action": action,
+                        "response": ticket_inquiry_response,
+                        "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                        "should_queue": should_queue,
+                        "kb_context_used": False,
+                        "complexity_analysis": complexity_analysis,
+                    }
+                else:
+                    # Customer described a problem AND asked for a ticket
+                    # Try to solve it first instead of immediately creating a ticket
+                    logger.info(
+                        "Ticket inquiry with problem description - will attempt to solve first",
+                        ticket_id=ticket_id,
+                        message=message,
+                        has_ticket_inquiry=has_ticket_inquiry,
+                        has_problem_description=has_problem_description,
+                    )
+                    # Continue to normal processing to try to solve the issue
+                    # Don't create ticket immediately - let the AI try to help first
+
+            # EXPLICIT AGENT REQUEST: If is_agent_request parameter is True, escalate directly
+            # This is a hard trigger from the "talk to a human" button - should bypass all gating
+            # Check this early to bypass all other logic
+            if is_agent_request:
+                logger.info(
+                    "Explicit agent request detected - escalating directly",
+                    ticket_id=ticket_id,
+                    is_agent_request=is_agent_request,
+                )
+                should_escalate = True
+                escalation_reason = "explicit_agent_request"
+                should_queue = True
+                action = "queue_for_staff"
+                
+                # Keep this acknowledgment deterministic so a model cannot block
+                # the handoff by asking for product details.
+                response_text = (
+                    "I understand you'd like to speak with a human support agent. "
+                    "I'm escalating this conversation to the support team now."
+                )
+                
+                return {
+                    "action": action,
+                    "response": response_text,
+                    "confidence": 1.0,
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "escalation_reason": escalation_reason,
+                }
+
+            # Check for vague technical issues - but be more lenient with error codes
+            # KEY PRINCIPLE: Provide solutions for common errors, ask details only for truly vague issues
+            if has_vague_technical_issue and (message_too_short or lacks_details) and not is_follow_up:
+                # Check if it's a common error code that we can help with immediately
+                common_error_codes = ["401", "402", "403", "404", "500", "502", "503", "504"]
+                has_common_error = any(code in message.lower() for code in common_error_codes)
+                
+                if has_common_error:
+                    # For common error codes, try to help immediately instead of asking for details
+                    logger.info(
+                        "Common error code detected - will attempt to provide solution",
+                        ticket_id=ticket_id,
+                        message=message,
+                    )
+                    # Continue to normal processing to try to solve the issue
+                else:
+                    # Only ask for details if it's truly vague without specific error indicators
+                    logger.info(
+                        "Vague technical issue detected - asking for more details before resolution",
+                        ticket_id=ticket_id,
+                        message=message,
+                        message_too_short=message_too_short,
+                        lacks_details=lacks_details,
+                    )
+                    should_queue = False
+                    action = "gather_details"
+
+                    # Use Groq to generate targeted details gathering response
+                    try:
+                        # Build messages with conversation history for context
+                        messages = [
+                            ChatMessage(
+                                role="system",
+                                content="You are a helpful customer support AI for Shiva Softwares. The user has a vague technical issue. Ask them for specific details like what error message they see, what they were trying to do, which part of the system they were using, and if they have a screenshot. Be helpful and solution-oriented. If there is conversation history, read it carefully to understand the context before responding - never ask for information already provided." + LANGUAGE_POLICY
+                            )
+                        ]
+                        
+                        # Add conversation history if available
+                        if conversation_history:
+                            conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                            messages.extend(conversation_messages)
+                        else:
+                            messages.append(ChatMessage(role="user", content=message))
+                        
+                        details_response_obj = await self.groq_client.chat_completion(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=400,
+                            reasoning_effort="low",
+                        )
+                        details_response = details_response_obj.content
+                        # Enforce language policy
+                        details_response = enforce_language_policy(details_response, message)
+                    except Exception as e:
+                        logger.error("Failed to generate details response", error=str(e))
+                        details_response = "I can help you troubleshoot this issue! To provide the most accurate solution, could you share what specific error message you're seeing, what you were trying to do when this happened, and which part of the system you were using?"
+
+                    return {
+                        "action": action,
+                        "response": details_response,
+                        "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                        "should_queue": should_queue,
+                        "kb_context_used": False,
+                        "complexity_analysis": complexity_analysis,
+                    }
+
+            # Step 3: Use customer data provided by frontend
+            # Frontend passes customer data directly since customer is logged in
+            customer_account = customer_data
+
+            # Step 4: Search knowledge base with intelligent KB selection
+            selected_collection = self._select_knowledge_base(customer_data, message)
+            kb_context = await self._retrieve_knowledge_base_context(
+                message, 
+                customer_data=customer_data, 
+                selected_collection=selected_collection,
+                product_context=product_context,
+            )
+
+            # Step 4.5: Check if product selection is needed.
+            # Skip product selection for explicit agent requests - they should escalate immediately
+            needs_product_selection = False
+            if (
+                not is_agent_request  # Don't ask for product if user wants to speak to staff
+                and product_context is None
+                and ticket_service is None
+                and self._requires_product_selection(message, conversation_history)
+            ):
+                logger.info(
+                    "Product-specific issue requires product selection",
+                    message=message,
+                    ticket_id=ticket_id,
+                )
+                needs_product_selection = True
+                response_text = await self._product_selection_response(message, conversation_history)
+
+                return {
+                    "action": "product_selection",
+                    "response": response_text,
+                    "confidence": 0.3,
+                    "should_queue": False,
+                    "needs_product_selection": True,
+                    "needs_ticket": False,
+                    "complexity_analysis": complexity_analysis,
+                    "kb_context_used": False,
+                    "kb_similarity_score": None,
+                    "kb_article_ids": None,
+                    "metadata": {},
+                }
+
+            # Step 4.5: Use Groq to determine if question is out-of-scope based on KB context
+            # This replaces hardcoded keyword matching with intelligent LLM-based classification
+            # But be more lenient - only treat as out-of-scope if clearly unrelated and high confidence
+            try:
+                out_of_scope_analysis = await self.groq_client.is_out_of_scope(
+                    message=message,
+                    kb_context=kb_context,
+                    customer_data=customer_data,
+                )
+                
+                # Only block if very high confidence (>0.9) to avoid blocking legitimate Shiva issues
+                if out_of_scope_analysis["is_out_of_scope"] and out_of_scope_analysis["confidence"] > 0.9:
+                    logger.info(
+                        "Groq determined question is out-of-scope with high confidence",
+                        ticket_id=ticket_id,
+                        message=message,
+                        reasoning=out_of_scope_analysis["reasoning"],
+                        confidence=out_of_scope_analysis["confidence"],
+                    )
+                    should_queue = False
+                    action = "out_of_scope"
+
+                    # Use Groq to generate out-of-scope response
+                    try:
+                        # Build messages with conversation history for context
+                        messages = [
+                            ChatMessage(
+                                role="system",
+                                content="You are a helpful customer support AI for Shiva Softwares. The user's question appears to be outside the scope of Shiva Softwares-related topics. Politely redirect them to ask about Shiva Softwares-related questions such as their account, orders, products, payments, or any other Shiva Softwares features. Be helpful and welcoming. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                            )
+                        ]
+                        
+                        # Add conversation history if available
+                        if conversation_history:
+                            conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                            messages.extend(conversation_messages)
+                        else:
+                            messages.append(ChatMessage(role="user", content=message))
+                        
+                        out_of_scope_response_obj = await self.groq_client.chat_completion(
+                            messages=messages,
+                            temperature=0.7,
+                            max_tokens=400,
+                            reasoning_effort="low",
+                        )
+                        out_of_scope_response = out_of_scope_response_obj.content
+                        # Enforce language policy
+                        out_of_scope_response = enforce_language_policy(out_of_scope_response, message)
+                    except Exception as e:
+                        logger.error("Failed to generate out-of-scope response", error=str(e))
+                        out_of_scope_response = "I'm here to help with any Shiva Softwares-related questions or issues you might have—feel free to ask about your account, orders, products, payments, or anything else Shiva Softwares! What can I assist with today?"
+
+                    return {
+                        "action": action,
+                        "response": out_of_scope_response,
+                        "confidence": out_of_scope_analysis["confidence"],
+                        "should_queue": should_queue,
+                        "kb_context_used": len(kb_context) > 0,
+                        "complexity_analysis": complexity_analysis,
+                    }
+            except Exception as e:
+                logger.error(
+                    "Error in Groq out-of-scope analysis, continuing with normal processing",
+                    error=str(e),
+                    message=message,
+                )
+                # If Groq analysis fails, continue with normal processing
+                # This is a safe fallback
+
+            # Step 6: Use cached complexity analysis for speed
+            complexity_analysis = self._analyze_complexity_cached(
+                message=message,
+                has_kb_context=len(kb_context) > 0,
+                history_length=len(conversation_history),
+            )
+
+            # Step 7: Determine which client to use based on complexity
+            # Use Gemini for complex tasks if configured and threshold met
+            complexity_score = complexity_analysis.get("complexity_score", 0.0)
+            use_complex_client = (
+                self.complex_task_client is not None and
+                complexity_score >= settings.gemini_complexity_threshold
+            )
+            
+            client_to_use = self.complex_task_client if use_complex_client else self.groq_client
+            
+            if use_complex_client:
+                logger.info(
+                    "Using complex task client (Gemini) for high-complexity issue",
+                    complexity_score=complexity_score,
+                    threshold=settings.gemini_complexity_threshold,
+                )
+
+            # Step 8: Generate response using specialized agent system
+            # Try to use specialized agents first, fall back to general if needed
+            try:
+                agent_response, agent_name = await self.agent_orchestrator.handle_with_agent(
+                    message=message,
+                    customer_data=customer_data,
+                    kb_context=kb_context,
+                    conversation_history=conversation_history,
+                    product_context=product_context,
+                    client=client_to_use,
+                )
+                
+                logger.info(
+                    "Response generated by specialized agent",
+                    agent=agent_name,
+                    client_used="gemini" if use_complex_client else "groq",
+                    complexity_score=complexity_score,
+                    message_length=len(agent_response),
+                )
+            except Exception as e:
+                # Fallback to Groq if complex client fails
+                if use_complex_client:
+                    logger.warning(
+                        "Complex task client failed, falling back to Groq",
+                        error=str(e),
+                        complexity_score=complexity_score,
+                    )
+                    agent_response, agent_name = await self.agent_orchestrator.handle_with_agent(
+                        message=message,
+                        customer_data=customer_data,
+                        kb_context=kb_context,
+                        conversation_history=conversation_history,
+                        product_context=product_context,
+                        client=self.groq_client,
+                    )
+                    logger.info(
+                        "Response generated with fallback to Groq",
+                        agent=agent_name,
+                        message_length=len(agent_response),
+                    )
+                else:
+                    raise
+            
+            # Check if this is a simple task
+            is_simple_task = self.agent_orchestrator.is_simple_task(message)
+            
+            # Create LLMResponse from agent response
+            response = LLMResponse(
+                content=agent_response,
+                confidence=0.9 if is_simple_task else 0.8,  # Higher confidence for simple tasks
+                metadata={
+                    "agent_used": agent_name,
+                    "is_simple_task": is_simple_task,
+                    "client_used": "gemini" if use_complex_client else "groq",
+                    "complexity_score": complexity_score,
+                }
+            )
+
+            # Step 9: Skip solution validation for simple cases to improve speed
+            if not skip_complexity_analysis:
+                solution_validation = self._validate_solution_completeness(
+                    response.content, 
+                    kb_context, 
+                    message
+                )
+            else:
+                solution_validation = {"is_complete": True, "confidence": 0.8}
+            
+            # Step 9: Determine action based on confidence, complexity, and solution quality
+            should_queue = False
+            action = "auto_resolve"
+
+            # NEW APPROACH: Always try to provide a solution first
+            # Only escalate if this is a follow-up message indicating previous solution failed
+            solution_failed = self._detect_solution_failure(conversation_history, message)
+
+            # Check if this is a follow-up after an AI provided solution
+            previous_ai_attempts = []
+            if conversation_history:
+                # Check if history contains ChatMessage format (role/content) or database objects (sender)
+                if hasattr(conversation_history[0], 'role'):
+                    # ChatMessage format from Shiva Support
+                    previous_ai_attempts = [msg for msg in conversation_history if msg.role == "assistant"]
+                elif hasattr(conversation_history[0], 'sender'):
+                    # Database object format
+                    previous_ai_attempts = [msg for msg in conversation_history if hasattr(msg, 'sender') and msg.sender == MessageSender.SUPPORT_AI]
+                else:
+                    # Unknown format
+                    previous_ai_attempts = []
+                is_follow_up = len(previous_ai_attempts) > 0
+            else:
+                is_follow_up = False
+
+            # ESCALATION LOGIC - Only create tickets when we understand the problem and cannot solve it
+            # KEY PRINCIPLE: Understand first, solve when possible, escalate only when necessary
+            # Escalate only when:
+            # 1. Previous solution failed (customer indicates it didn't work after trying it)
+            # 2. Staff-only issues (security, legal, complex investigations - must have problem description)
+            # 3. Multiple failed attempts (customer has tried multiple AI solutions that didn't work)
+            # 4. Issue is complex AND we understand it (not in knowledge base, requires investigation)
+            # 5. Explicit agent/human request (customer insists on speaking to human - bypasses other checks)
+            # Note: Explicit agent request is handled early in the function and returns immediately
+
+            # Require problem description for any escalation (unless explicit agent request handled above)
+            if not has_problem_description and not is_follow_up:
+                logger.info(
+                    "No problem description provided - will not escalate, asking for details",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                should_queue = False
+                action = "gather_details"
+
+                # Use Groq to generate details gathering response
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The user has a technical issue but hasn't provided enough details. Ask them politely for more specific information like what they were trying to do, any error messages they see, which part of the system they were using, and when the issue started. Be helpful and solution-oriented. If there is conversation history, read it carefully to understand the context before responding - never ask for information already provided." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    details_response_obj = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    details_response = details_response_obj.content
+                    # Enforce language policy
+                    details_response = enforce_language_policy(details_response, message)
+                except Exception as e:
+                    logger.error("Failed to generate details response", error=str(e))
+                    details_response = "I'd like to help you with this! To give you the best solution, could you share a bit more detail about what's happening? For example, what exactly are you trying to do when the issue occurs, do you see any error messages, and when did this start?"
+
+                return {
+                    "action": action,
+                    "response": details_response,
+                    "confidence": 0.3,  # Low confidence for fallback hardcoded response
+                    "should_queue": should_queue,
+                    "kb_context_used": False,
+                    "complexity_analysis": complexity_analysis,
+                    "escalation_reason": None,
+                }
+
+            # Initialize escalation variables for normal flow
+            should_escalate = False
+            escalation_reason = None
+
+            staff_only_indicators = [
+                "charged twice", "unauthorized charge", "refund missing",
+                "account hacked", "security breach", "data loss",
+                "legal", "complaint"
+            ]
+            has_staff_only_issue = any(indicator in message.lower() for indicator in staff_only_indicators)
+            
+            # Removed from automatic escalation - try to solve first:
+            # - "account locked" (Groq can often provide password reset guidance)
+            # - "production down" (try troubleshooting first)
+            # - Server errors (try debugging steps first)
+            
+            # Additional check: most issues should be solved by Groq first
+            # Only escalate for truly complex or security-critical issues
+            simple_login_indicators = ["login", "password", "reset", "can't access", "unable to login", "account locked"]
+            is_simple_login_issue = any(indicator in message.lower() for indicator in simple_login_indicators)
+            
+            if is_simple_login_issue and not is_follow_up:
+                has_staff_only_issue = False  # Don't escalate simple login issues on first attempt
+            
+            # Production and server errors - try to solve first
+            server_indicators = ["production down", "server error", "500 error", "error 500", "outage"]
+            has_server_issue = any(indicator in message.lower() for indicator in server_indicators)
+            
+            if has_server_issue and not is_follow_up:
+                has_staff_only_issue = False  # Try to solve server issues first
+            
+            # Check for explicit agent/human requests - only escalate if customer insists
+            # after AI has attempted to help, or uses strong escalation language
+            agent_request_indicators = [
+                "talk to agent", "speak to agent", "human agent", "real person",
+                "talk to human", "speak to human", "agent please", "human please",
+                "real agent", "live agent", "escalate", "escalation", "manager", "supervisor",
+                "i want to speak to a person", "i need to talk to someone", "transfer me"
+            ]
+            # Also include direct ticket request indicators here for defense in depth
+            ticket_request_indicators = [
+                "raise a ticket", "please raise a ticket", "raise ticket for me",
+                "open a ticket", "please open a ticket", "open ticket for me",
+                "create a ticket", "please create a ticket", "create ticket for me",
+                "file a ticket", "please file a ticket", "file ticket for me",
+                "submit a ticket", "please submit a ticket", "submit ticket for me",
+                "log a ticket", "please log a ticket", "log ticket for me",
+                "escalate to a ticket", "escalate this to a ticket", "make a ticket",
+                "i need a ticket", "i want a ticket", "can you raise a ticket",
+                "can you open a ticket", "can you create a ticket", "need ticket created",
+                "file a ticket", "file ticket", "log a ticket", "log ticket"
+            ]
+            # General staff inquiry indicators (should be handled with helpful info, not escalation)
+            general_staff_inquiry = [
+                "can i speak to staff", "can i talk to staff", "speak to staff",
+                "talk to staff", "customer service", "support team", "help center"
+            ]
+            has_general_staff_inquiry = any(indicator in message.lower() for indicator in general_staff_inquiry)
+            # Removed: "customer service", "support team" from escalation - these are too general
+            has_agent_request = (
+                any(indicator in message.lower() for indicator in agent_request_indicators) or
+                any(indicator in message.lower() for indicator in ticket_request_indicators)
+            )
+
+            multiple_failed_attempts = len(previous_ai_attempts) >= 2 and solution_failed
+
+            # Check for general staff inquiries - provide helpful info instead of escalating
+            if has_general_staff_inquiry and not is_follow_up:
+                logger.info(
+                    "General staff inquiry detected - providing helpful information",
+                    ticket_id=ticket_id,
+                )
+                should_queue = False
+                action = "provide_staff_info"
+
+                # Use Groq to generate helpful staff info response
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The customer is asking about speaking to staff or customer service. Explain that you can help them directly with most issues including account access, order questions, technical problems, or how to use different features. Ask them what specific issue they're facing so you can help immediately instead of making them wait for a ticket. Be friendly and solution-oriented. If there is conversation history, read it carefully to understand the context before responding." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    staff_info_response_obj = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    staff_info_response = staff_info_response_obj.content
+                    # Enforce language policy
+                    staff_info_response = enforce_language_policy(staff_info_response, message)
+                except Exception as e:
+                    logger.error("Failed to generate staff info response", error=str(e))
+                    staff_info_response = "I'm here to help you directly! I can assist with most common issues right away, including account access, billing questions, technical problems, or how to use different features of the platform. What specific issue are you facing?"
+
+                return {
+                    "action": action,
+                    "response": staff_info_response,
+                    "confidence": 0.3,  # Low confidence for fallback hardcoded response
                     "should_queue": should_queue,
                     "kb_context_used": False,
                     "complexity_analysis": complexity_analysis,
                 }
 
-            # Check for simple greetings - never escalate these
-            simple_greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "thanks", "thank you", "bye", "goodbye"]
-            is_simple_greeting = any(greeting in message.lower() for greeting in simple_greetings)
+            # Check if customer is showing frustration or strong insistence
+            frustration_indicators = [
+                "this is not working", "still not working", "doesn't work",
+                "i already tried that", "that didn't help", "useless", "terrible",
+                "i'm tired of this", "enough", "just let me talk", "i insist"
+            ]
+            has_frustration = any(indicator in message.lower() for indicator in frustration_indicators)
 
-            if is_simple_greeting:
-                logger.info("Simple greeting detected - auto-resolving without escalation")
+            # Only escalate for agent requests if:
+            # 1. Customer has already received AI help (follow-up message)
+            # 2. Customer shows frustration/insistence
+            # 3. Multiple failed attempts
+            # Note: Explicit agent request is handled early in the function and returns immediately
+            should_escalate_for_agent = has_agent_request and (is_follow_up or has_frustration or multiple_failed_attempts)
+
+            # Debug logging
+            logger.debug(
+                "Escalation decision factors",
+                solution_failed=solution_failed,
+                has_staff_only_issue=has_staff_only_issue,
+                multiple_failed_attempts=multiple_failed_attempts,
+                has_agent_request=has_agent_request,
+                should_escalate_for_agent=should_escalate_for_agent,
+                has_frustration=has_frustration,
+                previous_ai_attempts=len(previous_ai_attempts),
+                is_follow_up=is_follow_up,
+                complexity_analysis=complexity_analysis,
+            )
+
+            # AI-DRIVEN TICKET DECISION: Gemini owns escalation decisions when configured.
+            # Groq remains the fallback if Gemini is unavailable or fails.
+            escalation_client = self.complex_task_client or self.groq_client
+            escalation_client_name = "gemini" if self.complex_task_client else "groq"
+            try:
+                escalation_decision = await escalation_client.should_escalate(
+                    message=message,
+                    response=response.content,
+                    kb_context=str(kb_context),
+                    conversation_history=conversation_history,
+                    customer_data=customer_data,
+                )
+                if not isinstance(escalation_decision, dict):
+                    raise ValueError("Escalation client returned non-structured metadata")
+                ai_decides_ticket = bool(escalation_decision.get("escalate", False))
+                escalation_decision_reason = escalation_decision["reason"]
+                escalation_confidence = escalation_decision["confidence"]
+                
+                logger.info(
+                    "AI-driven escalation decision",
+                    ticket_id=ticket_id,
+                    escalation_client=escalation_client_name,
+                    escalate=ai_decides_ticket,
+                    reason=escalation_decision_reason,
+                    confidence=escalation_confidence,
+                )
+                
+                logger.info(
+                    "Structured escalation decision",
+                    ticket_id=ticket_id,
+                    escalation_client=escalation_client_name,
+                    escalate=ai_decides_ticket,
+                    reason=escalation_decision_reason,
+                    confidence=escalation_confidence,
+                )
+            except Exception as e:
+                logger.error(
+                    "Error in structured escalation decision, falling back to phrase-matching",
+                    error=str(e),
+                    ticket_id=ticket_id,
+                )
+                # Fallback to phrase-matching if structured decision fails
+                ticket_creation_phrases = [
+                    "i'll create a ticket", "let me create a ticket", "i'll get this escalated",
+                    "let me escalate this", "i'll connect you with", "i'll get our team",
+                    "i'll raise a ticket", "create a ticket for you", "escalate to our team",
+                    "i'll open a ticket", "let me open a ticket"
+                ]
+                
+                response_lower = response.content.lower()
+                ai_decides_ticket = any(phrase in response_lower for phrase in ticket_creation_phrases)
+                escalation_decision_reason = "fallback_phrase_matching"
+                escalation_confidence = 0.6
+                escalation_client_name = "phrase_fallback"
+            
+            # ADDITIONAL CHECK: If this was an informational ticket question, NEVER create a ticket
+            # Only treat as informational if it's actually phrased as a question (how/what/does/is or contains ?)
+            informational_ticket_indicators = [
+                "how do i raise a ticket", "how to raise a ticket", "how to create a ticket",
+                "how do i create a ticket", "how to submit a ticket", "how do i submit a ticket",
+                "what is a ticket", "what is a support ticket", "how does ticket work",
+                "how do tickets work", "ticket process", "ticket system"
+            ]
+            message_lower = message.lower()
+            # Check if it's a question (starts with question words or contains ?)
+            is_question_format = (
+                message_lower.startswith(("how ", "what ", "does ", "is ", "can ", "do ")) or
+                "?" in message_lower
+            )
+            # Only treat as informational if it contains ticket indicators AND is a question
+            is_informational_ticket_question = (
+                is_question_format and
+                any(indicator in message_lower for indicator in informational_ticket_indicators)
+            )
+            
+            if is_informational_ticket_question:
+                # Force no ticket creation for informational questions
+                ai_decides_ticket = False
+                logger.info(
+                    "Informational ticket question detected - forcing no ticket creation",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+            
+            # Force no ticket creation if AI decided against it
+            if not ai_decides_ticket:
+                # Conservative fallback - only escalate for truly critical issues
+                should_escalate = False
+                
+                # Only escalate for critical security/legal issues
+                if has_staff_only_issue:
+                    should_escalate = True
+                    escalation_reason = "critical_security_legal_issue"
+                
+                # Only escalate after multiple failed attempts (3+)
+                elif multiple_failed_attempts and len(previous_ai_attempts) >= 3:
+                    should_escalate = True
+                    escalation_reason = f"multiple_failed_attempts_{len(previous_ai_attempts)}"
+                
+                # Only escalate for high complexity (0.7+ threshold to catch novel issues)
+                elif complexity_analysis.get("complexity_score", 0) >= 0.7:
+                    should_escalate = True
+                    escalation_reason = f"high_complexity_{complexity_analysis.get('complexity_score')}"
+            else:
+                # AI explicitly decided to create a ticket - use the structured reason
+                should_escalate = True
+                escalation_reason = f"{escalation_client_name}_ai_decision: {escalation_decision_reason}"
+            
+            # AI attempts cap: force escalation if cap reached, regardless of other factors
+            if ticket_service and await ticket_service.check_ai_attempts_cap(ticket_id):
+                should_escalate = True
+                escalation_reason = f"ai_attempts_cap_reached_{len(previous_ai_attempts)}"
+            
+            if should_escalate:
+                should_queue = True
+                action = "queue_for_staff"
+
+                logger.info(
+                    "AI-driven ticket decision",
+                    ticket_id=ticket_id,
+                    reason=escalation_reason,
+                    escalation_client=escalation_client_name,
+                    ai_decided=ai_decides_ticket,
+                    is_informational=is_informational_ticket_question,
+                    previous_attempts=len(previous_ai_attempts),
+                    complexity_score=complexity_analysis.get("complexity_score"),
+                )
+            else:
+                # If not escalating, auto-resolve
                 should_queue = False
                 action = "auto_resolve"
-            else:
-                # NEW APPROACH: Always try to provide a solution first
-                # Only escalate if this is a follow-up message indicating previous solution failed
-                solution_failed = self._detect_solution_failure(conversation_history, message)
-
-                # Check if this is a follow-up after an AI provided solution
-                previous_ai_attempts = [msg for msg in conversation_history if msg.sender == MessageSender.SUPPORT_AI]
-                is_follow_up = len(previous_ai_attempts) > 0
-
-                # Escalate only when:
-                # 1. Previous solution failed (customer indicates it didn't work)
-                # 2. Staff-only issues (security, legal, complex investigations)
-                # 3. Multiple failed attempts (customer has tried multiple AI solutions)
-                # 4. Issue is complex (not in knowledge base, requires investigation)
-                # 5. Explicit agent/human request (customer insists on speaking to human)
-                staff_only_indicators = [
-                    "charged twice", "unauthorized charge", "refund missing",
-                    "account locked", "account hacked", "security breach", "data loss",
-                    "legal", "complaint", "production down", "server error", "500"
-                ]
-                has_staff_only_issue = any(indicator in message.lower() for indicator in staff_only_indicators)
-                
-                # Check for explicit agent/human requests
-                agent_request_indicators = [
-                    "talk to agent", "speak to agent", "human agent", "real person",
-                    "talk to human", "speak to human", "agent please", "human please",
-                    "customer service", "support team", "real agent", "live agent",
-                    "escalate", "escalation", "manager", "supervisor"
-                ]
-                has_agent_request = any(indicator in message.lower() for indicator in agent_request_indicators)
-
-                multiple_failed_attempts = len(previous_ai_attempts) >= 2 and solution_failed
-
-                # Debug logging
-                logger.debug(
-                    "Escalation decision factors",
-                    solution_failed=solution_failed,
-                    has_staff_only_issue=has_staff_only_issue,
-                    multiple_failed_attempts=multiple_failed_attempts,
-                    has_agent_request=has_agent_request,
-                    previous_ai_attempts=len(previous_ai_attempts),
-                    is_follow_up=is_follow_up,
-                    complexity_analysis=complexity_analysis,
-                )
-
-                if solution_failed or has_staff_only_issue or multiple_failed_attempts or has_agent_request or complexity_analysis.get("is_complex"):
-                    should_queue = True
-                    action = "queue_for_staff"
-
-                    if solution_failed:
-                        logger.info(
-                            "Previous solution failed - escalating to staff",
-                            ticket_id=ticket_id,
-                            previous_attempts=len(previous_ai_attempts),
-                        )
-                    elif has_staff_only_issue:
-                        logger.info(
-                            "Staff-only issue detected - escalating to staff",
-                            ticket_id=ticket_id,
-                        )
-                    elif multiple_failed_attempts:
-                        logger.info(
-                            "Multiple failed solution attempts - escalating to staff",
-                            ticket_id=ticket_id,
-                            attempts=len(previous_ai_attempts),
-                        )
-                    elif has_agent_request:
-                        logger.info(
-                            "Explicit agent request detected - escalating to staff",
-                            ticket_id=ticket_id,
-                        )
-                    elif complexity_analysis.get("is_complex"):
-                        logger.info(
-                            "Complex issue detected - escalating to staff",
-                            ticket_id=ticket_id,
-                            complexity_score=complexity_analysis.get("complexity_score"),
-                            reasons=complexity_analysis.get("reasons"),
-                        )
 
             logger.info(
                 "Support AI processed message",
@@ -232,17 +1393,45 @@ class SupportAIService:
                 is_agent_request=is_agent_request,
             )
 
+            # Calculate KB similarity score for analytics
+            kb_similarity_score = max([r.score for r in kb_context]) if kb_context else None
+            kb_article_ids = [r.id for r in kb_context] if kb_context else None
+
             # Use the appropriate response based on action
             final_response = response.content if action != "out_of_scope" else response
-            
-            return {
+
+            # Generate conversation title for meaningful issues
+            conversation_title = await self._generate_conversation_title(
+                message,
+                conversation_history,
+                client=client_to_use,
+            )
+
+            # Build response with analysis metadata
+            result = {
                 "action": action,
                 "response": response.content,
                 "confidence": response.confidence,
                 "should_queue": should_queue,
                 "kb_context_used": len(kb_context) > 0,
                 "complexity_analysis": complexity_analysis,
+                "kb_similarity_score": kb_similarity_score,
+                "kb_article_ids": kb_article_ids,
+                "metadata": response.metadata,
+                "ticket_decision_provider": escalation_client_name,
+                "escalation_reason": escalation_reason if should_escalate else None,
+                "needs_product_selection": False,
+                "needs_ticket": should_queue,
+                "analysis": {
+                    "needs_ticket": should_queue
+                }
             }
+            
+            # Only add conversation_title if it was generated (not a greeting)
+            if conversation_title:
+                result["analysis"]["conversation_title"] = conversation_title
+
+            return result
 
         except Exception as e:
             logger.error(
@@ -257,34 +1446,395 @@ class SupportAIService:
                 "confidence": 0.0,
                 "should_queue": True,
                 "error": str(e),
+                "kb_similarity_score": None,
+                "kb_article_ids": None,
+                "metadata": {},
             }
+
+    async def handle_customer_message_stream(
+        self,
+        ticket_id: str,
+        customer_id: str,
+        message: str,
+        ticket_service: Optional[TicketCenterService],
+        is_agent_request: bool = False,
+        conversation_history: Optional[List] = None,
+        customer_data: Optional[Dict[str, Any]] = None,
+        product_context: Optional[Dict[str, Any]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """
+        Handle a customer message with streaming response.
+
+        This is a simplified streaming version that focuses on the core streaming
+        functionality. For production use, this should be expanded to include the
+        full pipeline (KB retrieval, escalation decision, etc.).
+
+        Args:
+            product_context: Dict containing product-specific information:
+                          - product_id: str
+                          - product_name: str
+                          - enabled_modules: List[str]
+                          - client_entitled: bool
+                          - relevant_knowledge_articles: List[str]
+
+        Yields dictionaries with keys:
+        - content: str (streamed content chunks)
+        - done: bool (true on final chunk)
+        """
+        try:
+            # Detect typed agent requests - same logic as normal path
+            if self._is_explicit_agent_request(message):
+                is_agent_request = True
+
+            # EXPLICIT TICKET REQUEST: Detect direct requests to raise/open/create a ticket
+            # This should bypass streaming and escalate immediately
+            ticket_request_indicators = [
+                "raise a ticket", "please raise a ticket", "raise ticket for me",
+                "open a ticket", "please open a ticket", "open ticket for me",
+                "create a ticket", "please create a ticket", "create ticket for me",
+                "file a ticket", "please file a ticket", "file ticket for me",
+                "submit a ticket", "please submit a ticket", "submit ticket for me",
+                "log a ticket", "please log a ticket", "log ticket for me",
+                "escalate to a ticket", "escalate this to a ticket", "make a ticket",
+                "i need a ticket", "i want a ticket", "can you raise a ticket",
+                "can you open a ticket", "can you create a ticket", "need ticket created",
+                "file a ticket", "file ticket", "log a ticket", "log ticket"
+            ]
+            is_direct_ticket_request = any(indicator in message.lower() for indicator in ticket_request_indicators)
+            
+            if is_direct_ticket_request:
+                logger.info(
+                    "Direct ticket request detected in streaming - escalating immediately",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                
+                # Generate a response acknowledging the ticket creation with context
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The customer has explicitly requested a support ticket. Acknowledge their request and confirm that you're escalating it to the support team. If there is conversation history, read it carefully to understand the context before responding - acknowledge the issue they've been discussing." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    ticket_request_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = ticket_request_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                except Exception as e:
+                    logger.error("Failed to generate ticket request response in streaming", error=str(e))
+                    response_text = "I understand you'd like a support ticket created. I'm escalating this to our support team right away."
+                
+                # Yield a single chunk with the escalation message
+                yield {
+                    "content": response_text,
+                    "done": False,
+                }
+                # Yield final chunk with escalation metadata
+                yield {
+                    "content": "",
+                    "done": True,
+                    "action": "queue_for_staff",
+                    "confidence": 1.0,
+                    "should_queue": True,
+                    "escalation_reason": "explicit_ticket_request",
+                    "agent_name": "SupportAgent",
+                }
+                return
+
+            # EXPLICIT AGENT REQUEST: Handle typed requests to speak to staff
+            if is_agent_request:
+                logger.info(
+                    "Explicit agent request detected in streaming - escalating immediately",
+                    ticket_id=ticket_id,
+                    message=message,
+                )
+                
+                # Generate a response acknowledging the escalation with context
+                try:
+                    # Build messages with conversation history for context
+                    messages = [
+                        ChatMessage(
+                            role="system",
+                            content="You are a helpful customer support AI for Shiva Softwares. The customer has explicitly requested to speak with a human agent. Acknowledge their request and confirm that you're escalating it to the support team. Do not ask them to select or identify a product. If there is conversation history, read it carefully to understand the context before responding - acknowledge the issue they've been discussing." + LANGUAGE_POLICY
+                        )
+                    ]
+                    
+                    # Add conversation history if available
+                    if conversation_history:
+                        conversation_messages = self.agent_orchestrator.agents[0]._build_conversation_messages(conversation_history, message)
+                        messages.extend(conversation_messages)
+                    else:
+                        messages.append(ChatMessage(role="user", content=message))
+                    
+                    agent_request_response = await self.groq_client.chat_completion(
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=400,
+                        reasoning_effort="low",
+                    )
+                    response_text = agent_request_response.content
+                    # Enforce language policy
+                    response_text = enforce_language_policy(response_text, message)
+                except Exception as e:
+                    logger.error("Failed to generate agent request response in streaming", error=str(e))
+                    response_text = "I understand you'd like to speak with a human agent. I'm escalating your request to our support team right away."
+                
+                # Yield a single chunk with the escalation message
+                yield {
+                    "content": response_text,
+                    "done": False,
+                }
+                # Yield final chunk with escalation metadata
+                yield {
+                    "content": "",
+                    "done": True,
+                    "action": "queue_for_staff",
+                    "confidence": 1.0,
+                    "should_queue": True,
+                    "needs_product_selection": False,
+                    "needs_ticket": True,
+                    "analysis": {"needs_product_selection": False, "needs_ticket": True},
+                    "escalation_reason": "explicit_agent_request",
+                    "agent_name": "SupportAgent",
+                }
+                return
+
+            # Convert conversation history to ChatMessage format if it's a list of dicts (from Shiva Support)
+            if conversation_history and isinstance(conversation_history[0], dict):
+                # Map Shiva Support role format to LLM role format
+                role_mapping = {
+                    "user": "user",
+                    "assistant": "assistant",
+                    "system": "system"
+                }
+                conversation_history = [
+                    ChatMessage(
+                        role=role_mapping.get(msg.get("role", "user"), "user"),
+                        content=msg.get("content", "")
+                    )
+                    for msg in conversation_history
+                ]
+            elif conversation_history and hasattr(conversation_history[0], 'sender'):
+                # Already in database object format, agents will handle conversion
+                pass
+            else:
+                # Empty or unknown format
+                conversation_history = []
+
+            # Stop before retrieval and answer generation when product-specific context is required.
+            # Skip product selection for explicit agent requests - they should escalate immediately
+            needs_product_selection = (
+                not is_agent_request  # Don't ask for product if user wants to speak to staff
+                and product_context is None
+                and ticket_service is None
+                and self._requires_product_selection(message, conversation_history)
+            )
+            if needs_product_selection:
+                response_text = await self._product_selection_response(message, conversation_history)
+                yield {"content": response_text, "done": False}
+                yield {
+                    "content": "",
+                    "done": True,
+                    "action": "product_selection",
+                    "confidence": 0.3,
+                    "should_queue": False,
+                    "needs_product_selection": True,
+                    "needs_ticket": False,
+                    "analysis": {
+                        "needs_product_selection": True,
+                        "needs_ticket": False,
+                    },
+                }
+                return
+
+            # Retrieve KB context (same as normal path)
+            selected_collection = self._select_knowledge_base(customer_data, message)
+            kb_context = await self._retrieve_knowledge_base_context(
+                message, 
+                customer_data=customer_data, 
+                selected_collection=selected_collection,
+                product_context=product_context,
+            )
+
+            # Stream the AI response
+            full_response = ""
+            agent_name = ""
+
+            async for chunk, chunk_agent_name in self.agent_orchestrator.handle_with_agent_stream(
+                message=message,
+                customer_data=customer_data,
+                kb_context=kb_context,
+                conversation_history=conversation_history,
+                product_context=product_context,
+            ):
+                if chunk_agent_name:  # First chunk contains agent name
+                    agent_name = chunk_agent_name
+                full_response += chunk
+                yield {
+                    "content": chunk,
+                    "done": False,
+                }
+
+            # Generate conversation title for meaningful issues
+            conversation_title = await self._generate_conversation_title(
+                message,
+                conversation_history,
+                client=self.complex_task_client or self.groq_client,
+            )
+
+            # Build analysis metadata
+            analysis_metadata = {
+                "needs_ticket": False
+            }
+            
+            # Only add conversation_title if it was generated (not a greeting)
+            if conversation_title:
+                analysis_metadata["conversation_title"] = conversation_title
+
+            # Yield final chunk with metadata
+            yield {
+                "content": "",
+                "done": True,
+                "action": "auto_resolve",
+                "confidence": 0.8,
+                "should_queue": False,
+                "kb_context_used": len(kb_context) > 0,
+                "complexity_analysis": {"is_complex": False, "complexity_score": 0.0, "reasons": []},
+                "kb_similarity_score": max([r.score for r in kb_context]) if kb_context else None,
+                "kb_article_ids": [r.id for r in kb_context] if kb_context else None,
+                "metadata": {"agent_used": agent_name},
+                "escalation_reason": None,
+                "needs_product_selection": needs_product_selection,
+                "needs_ticket": False,
+                "analysis": analysis_metadata
+            }
+
+        except Exception as e:
+            logger.error(
+                "Support AI streaming processing failed",
+                ticket_id=ticket_id,
+                error=str(e),
+            )
+            # Yield error as final chunk
+            yield {
+                "content": "",
+                "done": True,
+                "error": str(e),
+            }
+            raise
+
+    def _select_knowledge_base(
+        self,
+        customer_data: Optional[Dict[str, Any]],
+        message: str,
+    ) -> str:
+        """
+        Select the appropriate knowledge base based on the customer's application.
+        
+        The frontend provides the application information in customer_data.
+        Selection priority:
+        1. Application-based (from customer_data.application)
+        2. Default KB as fallback
+        """
+        # Application-based selection (primary method)
+        if customer_data:
+            application = customer_data.get("application", "").lower()
+            app_rules = settings.kb_selection_rules["application_based"]
+            
+            if application and application in app_rules:
+                selected_kb = app_rules[application]
+                logger.info(
+                    "KB selected based on customer application",
+                    application=application,
+                    selected_kb=selected_kb,
+                    customer_id=customer_data.get("customer_id"),
+                )
+                return selected_kb
+        
+        # Default fallback
+        default_kb = settings.qdrant_collections["default"]
+        logger.info(
+            "Using default knowledge base (no application specified)",
+            default_kb=default_kb,
+            message=message,
+            application=customer_data.get("application") if customer_data else None,
+        )
+        return default_kb
 
     async def _retrieve_knowledge_base_context(
         self,
         query: str,
         max_results: int = 5,
         score_threshold: Optional[float] = None,
+        customer_data: Optional[Dict[str, Any]] = None,
+        selected_collection: Optional[str] = None,
+        product_context: Optional[Dict[str, Any]] = None,
     ) -> List[SearchResult]:
-        """Retrieve relevant context from knowledge base."""
+        """Retrieve relevant context from knowledge base with intelligent KB selection and product filtering."""
         try:
+            # Select appropriate KB based on customer data and message (if not provided)
+            if selected_collection is None:
+                selected_collection = self._select_knowledge_base(customer_data, query)
+            
             # Embed the query
             query_vector = await self.qdrant_client.embed_text(query)
             
             # Use provided threshold or default to settings
             threshold = score_threshold or settings.qdrant_similarity_threshold
             
-            # Search for similar documents
-            results = await self.qdrant_client.search(
-                query_vector=query_vector,
-                limit=max_results,
-                score_threshold=threshold,
-            )
+            # Build filter for product_id if product_context is present
+            filter_condition = None
+            if product_context and product_context.get("product_id"):
+                product_id = product_context["product_id"]
+                # Filter by product_id in the payload
+                filter_condition = {
+                    "must": [
+                        {
+                            "key": "product_id",
+                            "match": {"value": product_id}
+                        }
+                    ]
+                }
+                logger.info(
+                    "Filtering KB by product_id",
+                    product_id=product_id,
+                    product_name=product_context.get("product_name"),
+                )
+            
+            # Search for similar documents in the selected collection
+            search_kwargs = {
+                "query_vector": query_vector,
+                "limit": max_results,
+                "score_threshold": threshold,
+                "collection_name": selected_collection,
+            }
+            if filter_condition is not None:
+                search_kwargs["filter"] = filter_condition
+            results = await self.qdrant_client.search(**search_kwargs)
             
             logger.debug(
                 "Retrieved KB context",
                 query_length=len(query),
                 results_count=len(results),
                 threshold=threshold,
+                selected_collection=selected_collection,
+                customer_plan=customer_data.get("plan") if customer_data else None,
+                product_id=product_context.get("product_id") if product_context else None,
             )
             
             return results
@@ -296,176 +1846,43 @@ class SupportAIService:
             )
             return []
 
-    async def _generate_response(
-        self,
-        message: str,
-        conversation_history: List["TicketMessage"],
-        customer_account: Optional[CustomerAccount],
-        kb_context: List[SearchResult],
-        is_agent_request: bool = False,
-    ) -> LLMResponse:
-        """Generate response using Groq LLM with RAG context."""
-        
-        # Build system prompt
-        system_prompt = self._build_system_prompt(kb_context, customer_account, is_agent_request)
-        
-        # Build conversation messages
-        messages = [ChatMessage(role="system", content=system_prompt)]
 
-        # Add conversation history (last 10 messages to avoid context overflow)
-        recent_history = conversation_history[-10:] if len(conversation_history) > 10 else conversation_history
-        for msg in recent_history:
-            # Determine role based on sender (works for both TicketMessage and ChatMessage)
-            role = "user" if msg.sender == MessageSender.CUSTOMER else "assistant"
-            messages.append(ChatMessage(role=role, content=msg.content))
-        
-        # Add current message
-        messages.append(ChatMessage(role="user", content=message))
-        
-        # Generate response with higher token limit for detailed solutions
-        response = await self.groq_client.chat_completion(
-            messages=messages,
-            temperature=0.2,  # Even lower temperature for more consistent, actionable responses
-            max_tokens=1500,  # Higher token limit for more detailed solutions
-        )
-        
-        # Enhance confidence calculation based on solution quality
-        enhanced_confidence = self._enhance_confidence_calculation(
-            response.content, 
-            kb_context, 
-            response.confidence
-        )
-        
-        response.confidence = enhanced_confidence
-        
-        logger.debug(
-            "Generated Support AI response",
-            original_confidence=response.confidence,
-            enhanced_confidence=enhanced_confidence,
-            response_length=len(response.content),
-            kb_context_count=len(kb_context),
-        )
-        
-        return response
 
-    def _enhance_confidence_calculation(
-        self,
-        response_content: str,
-        kb_context: List[SearchResult],
-        original_confidence: float
-    ) -> float:
-        """
-        Enhance confidence calculation based on solution quality indicators.
-        
-        This analyzes the response to ensure it provides actionable solutions
-        rather than just information.
-        """
-        if not response_content:
-            return 0.0
-        
-        response_lower = response_content.lower()
-        enhanced_confidence = original_confidence
-        
-        # Positive indicators that increase confidence
-        positive_indicators = [
-            "step", "follow", "click", "go to", "navigate", "select",
-            "first", "then", "next", "after", "finally", "complete",
-            "solution", "fix", "resolve", "should", "can", "will"
-        ]
-        
-        # Check for step-by-step format
-        step_count = 0
-        for indicator in positive_indicators:
-            if indicator in response_lower:
-                step_count += 1
-        
-        # Bonus for structured solutions
-        if step_count >= 3:
-            enhanced_confidence += 0.1  # Strong step-by-step structure
-        elif step_count >= 1:
-            enhanced_confidence += 0.05  # Some actionable content
-        
-        # Check for specific actionable elements
-        actionable_elements = [
-            "settings", "button", "menu", "tab", "page", "link",
-            "option", "field", "form", "account", "profile"
-        ]
-        actionable_count = sum(1 for element in actionable_elements if element in response_lower)
-        if actionable_count >= 2:
-            enhanced_confidence += 0.05  # Contains specific UI elements
-        
-        # Check for verification steps (shows completeness)
-        verification_indicators = [
-            "verify", "check", "confirm", "ensure", "make sure",
-            "test", "try", "should see", "will appear"
-        ]
-        if any(indicator in response_lower for indicator in verification_indicators):
-            enhanced_confidence += 0.05  # Includes verification steps
-        
-        # Check for alternative solutions (shows robustness)
-        if "alternatively" in response_lower or "or" in response_lower and "if" in response_lower:
-            enhanced_confidence += 0.03  # Provides alternatives
-        
-        # Negative indicators that decrease confidence
-        negative_indicators = [
-            "might", "maybe", "possibly", "probably", "should work",
-            "try to", "i think", "not sure", "unclear", "unsure"
-        ]
-        if any(indicator in response_lower for indicator in negative_indicators):
-            enhanced_confidence -= 0.1  # Uncertain language
-        
-        # Check for incomplete solutions
-        incomplete_indicators = [
-            "contact support", "reach out", "speak to", "cannot help",
-            "not available", "don't have information", "unable to"
-        ]
-        if any(indicator in response_lower for indicator in incomplete_indicators):
-            enhanced_confidence -= 0.15  # Escalation without solution
-        
-        # Check for knowledge base quality
-        if kb_context:
-            avg_kb_score = sum(result.score for result in kb_context) / len(kb_context)
-            if avg_kb_score >= 0.8:
-                enhanced_confidence += 0.05  # High-quality KB matches
-            elif avg_kb_score < 0.5:
-                enhanced_confidence -= 0.1  # Low-quality KB matches
-        
-        # Ensure confidence stays within valid range
-        enhanced_confidence = max(0.0, min(1.0, enhanced_confidence))
-        
-        logger.debug(
-            "Enhanced confidence calculation",
-            original_confidence=original_confidence,
-            enhanced_confidence=enhanced_confidence,
-            step_count=step_count,
-            actionable_count=actionable_count,
-        )
-        
-        return enhanced_confidence
 
     async def _is_out_of_scope_groq(self, message: str) -> bool:
         """
-        Use Groq API to intelligently determine if a message is out of scope for Shiva AI Platform support.
+        Use Groq API to intelligently determine if a message is out of scope for Shiva Softwares support.
         
         This is more accurate than keyword matching as it understands context and nuance.
         """
         try:
             # Use Groq to classify if the message is in-scope
-            classification_prompt = f"""Classify if this customer message is IN-SCOPE or OUT-OF-SCOPE for Shiva AI Platform customer support.
+            classification_prompt = f"""Classify if this customer message is IN-SCOPE or OUT-OF-SCOPE for Shiva Softwares customer support.
 
 IN-SCOPE messages relate to:
-- Account access (login, password, account locked)
-- Billing and payments (payment failed, card declined, refund)
-- Technical issues (errors, bugs, integration problems)
-- Platform features and usage (dashboard, API, specific functionality)
-- Subscription management (plans, upgrades, cancellations)
+- Account access (login, password, account locked, verification)
+- Billing and payments (payment failed, card declined, refund, invoice)
+- Orders and delivery (order tracking, delivery issues, shipping)
+- Account management (login, password, profile, addresses)
+- Products and browsing (catalogue, search, product details)
+- Shopping and checkout (cart, coupons, payment process)
+- Returns and refunds (return policy, refund requests)
+- Technical issues (errors, bugs, checkout problems)
+- Product reviews and ratings
+- General Shiva Softwares support questions
 
 OUT-OF-SCOPE messages include:
-- Personal feelings/emotions (bored, tired, happy, sad)
-- Casual conversation (how are you, nice to meet you)
-- Entertainment requests (jokes, games, movies)
-- General questions unrelated to Shiva AI Platform
-- Personal life matters
+- Personal feelings/emotions (bored, tired, happy, sad, frustrated, angry)
+- Casual conversation (how are you, nice to meet you, what's up)
+- Entertainment requests (jokes, games, movies, music, fun facts)
+- General knowledge questions unrelated to Shiva Softwares
+- Personal life matters (relationships, health, family, personal advice)
+- Political/religious discussions
+- News/current events (unless directly related to Shiva Softwares)
+- Weather, sports scores, entertainment news
+- Philosophical or abstract questions
+- Creative writing or content generation requests
+- Role-playing or fictional scenarios
 
 Customer message: "{message}"
 
@@ -475,6 +1892,7 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                 messages=[ChatMessage(role="user", content=classification_prompt)],
                 temperature=0.1,  # Low temperature for consistent classification
                 max_tokens=10,   # Only need classification result
+                reasoning_effort="low",  # Classification doesn't need reasoning
             )
             
             classification = classification_response.content.strip().upper()
@@ -498,68 +1916,6 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
             # If Groq fails, assume in-scope to avoid blocking legitimate issues
             return False
 
-    def _is_out_of_scope(self, message: str) -> bool:
-        """
-        Fallback method: Detect if a message is out of scope using keyword matching.
-        Only used if Groq classification fails.
-        """
-        message_lower = message.lower()
-        
-        # Out-of-scope indicators
-        out_of_scope_indicators = [
-            "bored", "boring", "im bored", "feel bored",
-            "tired", "im tired", "exhausted", "sleepy",
-            "hungry", "thirsty", "im hungry", "im thirsty",
-            "happy", "sad", "angry", "excited", "scared", "worried",
-            "love", "hate", "like", "dislike",
-            "funny", "joke", "laugh", "humor",
-            "game", "play", "movie", "music", "song",
-            "weather", "temperature", "raining", "sunny",
-            "how are you", "how do you do", "whats up", "sup",
-            "nice to meet you", "hello there", "hey there",
-            "friend", "friendship", "relationship",
-            "life", "my life", "personal", "my personal",
-            "opinion", "what do you think", "do you think",
-            "advice", "give me advice", "need advice",
-            "recommend", "recommendation", "suggest something",
-            "random", "random question", "just asking",
-            "curious", "just curious", "wondering",
-            "tell me about", "tell me something", "can you tell me",
-            "interesting", "interesting fact", "fun fact",
-            "conversation", "chat", "talk", "just talking",
-            "free time", "spare time", "killing time",
-            "nothing to do", "have nothing to do", "nothing"
-        ]
-        
-        # Check for out-of-scope indicators
-        for indicator in out_of_scope_indicators:
-            if indicator in message_lower:
-                logger.debug(
-                    "Out-of-scope message detected (fallback)",
-                    indicator=indicator,
-                )
-                return True
-        
-        # Check if message is very short and doesn't contain platform-related terms
-        platform_keywords = [
-            "account", "login", "password", "billing", "payment", "card",
-            "subscription", "plan", "upgrade", "downgrade", "cancel",
-            "error", "bug", "issue", "problem", "help", "support",
-            "shiva", "platform", "ai", "feature", "dashboard", "api",
-            "integration", "code", "development", "deployment", "server"
-        ]
-        
-        has_platform_keyword = any(keyword in message_lower for keyword in platform_keywords)
-        
-        # If message is short (<15 chars) and has no platform keywords, it's likely out of scope
-        if len(message) < 15 and not has_platform_keyword:
-            logger.debug(
-                "Short message without platform keywords detected as out of scope (fallback)",
-                message_length=len(message),
-            )
-            return True
-        
-        return False
 
     def _detect_solution_failure(
         self,
@@ -631,7 +1987,20 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                 return True
         
         # Check if customer is repeating the same issue after AI provided solution
-        previous_ai_messages = [msg for msg in conversation_history if msg.sender == MessageSender.SUPPORT_AI]
+        if conversation_history:
+            # Check if history contains ChatMessage format (role/content) or database objects (sender)
+            if hasattr(conversation_history[0], 'role'):
+                # ChatMessage format from Shiva Support
+                previous_ai_messages = [msg for msg in conversation_history if msg.role == "assistant"]
+            elif hasattr(conversation_history[0], 'sender'):
+                # Database object format
+                previous_ai_messages = [msg for msg in conversation_history if hasattr(msg, 'sender') and msg.sender == MessageSender.SUPPORT_AI]
+            else:
+                # Unknown format
+                previous_ai_messages = []
+        else:
+            previous_ai_messages = []
+        
         if not previous_ai_messages:
             return False
         
@@ -640,10 +2009,19 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
         if len(previous_ai_messages) >= 1:
             # Get the initial customer message
             initial_customer_msg = None
-            for msg in conversation_history:
-                if msg.sender == MessageSender.CUSTOMER:
-                    initial_customer_msg = msg
-                    break
+            if conversation_history:
+                if hasattr(conversation_history[0], 'role'):
+                    # ChatMessage format
+                    for msg in conversation_history:
+                        if msg.role == "user":
+                            initial_customer_msg = msg
+                            break
+                elif hasattr(conversation_history[0], 'sender'):
+                    # Database object format
+                    for msg in conversation_history:
+                        if hasattr(msg, 'sender') and msg.sender == MessageSender.CUSTOMER:
+                            initial_customer_msg = msg
+                            break
             
             if initial_customer_msg:
                 # Check if current message has significant overlap with initial problem
@@ -758,170 +2136,32 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
             "confidence": completeness_score
         }
 
-    def _build_system_prompt(
-        self,
-        kb_context: List[SearchResult],
-        customer_account: Optional[CustomerAccount],
-        is_agent_request: bool = False,
-    ) -> str:
-        """Build system prompt with RAG context and customer info."""
-        
-        prompt_parts = [
-            "You are a helpful customer support AI assistant for Shiva AI Platform.",
-            "Your role is to provide actionable, working solutions to customer issues based on the provided knowledge base context.",
-            "",
-            "SCOPE CONTEXT:",
-            "- This message has been pre-classified as relevant to Shiva AI Platform support.",
-            "- Focus on helping with: account access, billing, payments, technical errors, product features, platform usage.",
-            "- Provide practical solutions based on the knowledge base context provided below.",
-            "",
-            "CRITICAL APPROACH: SOLUTION-FIRST POLICY",
-            "- ALWAYS provide a solution first, even if you're not 100% certain it will work",
-            "- Give customers something they can try immediately rather than escalating immediately",
-            "- Only mention escalation if the customer indicates the solution didn't work",
-            "- Your primary goal is to be helpful and reduce customer frustration",
-            "",
-            "CRITICAL ROUTING RULE:",
-            "- When relevant knowledge-base context is supplied, answer only from that context and give the customer a complete solution.",
-            "- Do not invent product behavior, account data, policies, URLs, or troubleshooting steps that are absent from the knowledge base.",
-            "- If the request is complex, account-specific, security-sensitive, or not covered by the supplied context, do not pretend it is solved; it will be routed to a staff member.",
-            "",
-            "CRITICAL RULES FOR PREVENTING USER FRUSTRATION:",
-            "- Give customers a concise solution they can use immediately when the knowledge base supports it",
-            "- Focus on being helpful and supportive rather than avoiding mistakes",
-            "- If information is incomplete, provide the best possible solution based on available context",
-            "- Ask the customer to try the solution and report back if it doesn't work",
-            "- Provide multiple options when possible so customers have choices",
-            "- Include troubleshooting tips for common issues that might occur",
-            "- NEVER apologize or say 'I'm sorry' - be direct and solution-focused",
-            "- NEVER show confidence scores or technical metrics to customers",
-            "",
-            "OUT-OF-SCOPE RESPONSE:",
-            "- If a customer asks about topics outside Shiva AI Platform support (weather, sports, entertainment, personal advice, etc.), respond with: 'I am here to help with any Shiva-related questions or issues you might have—feel free to ask about your account, service, payments, or anything else Shivasoftwares! What can I assist with today?'",
-            "- Do not provide information about topics unrelated to Shiva AI Platform",
-            "",
-            "CRITICAL RULES FOR PROVIDING WORKING SOLUTIONS:",
-            "- Provide step-by-step, actionable instructions that customers can follow immediately",
-            "- Include specific paths, button names, and exact text the customer should look for",
-            "- If suggesting a solution, verify it's complete and actionable",
-            "- Include troubleshooting steps if the solution might not work on first try",
-            "- Provide alternative solutions if the primary solution might fail",
-            "- Include relevant warnings or common mistakes to avoid",
-            "- If the solution requires specific customer information (account type, plan, etc.), reference it",
-            "- ALWAYS end with: 'Please try this solution and let me know if it works or if you need further assistance.'",
-            "",
-            "KNOWLEDGE BASE USAGE:",
-            "- Use the provided knowledge base context as your primary source",
-            "- If the context doesn't contain a complete solution, provide the best partial solution available",
-            "- Combine information from multiple knowledge base documents if needed",
-            "- If information is missing, acknowledge this but still provide helpful guidance",
-            "- Never make up information, but always try to be helpful with what you know",
-            "",
-            "RESPONSE STRUCTURE:",
-            "- Start with **Solution** and a one-sentence outcome.",
-            "- Use clear section headers with **bold** formatting",
-            "- Provide clear, numbered steps for any solution",
-            "- Include what to expect at each step",
-            "- End with how to verify the solution worked",
-            "- Always provide alternatives or next steps if the primary solution might fail",
-            "- Include contact information as a LAST resort, not the first option",
-            "- DO NOT include confidence scores, error messages, or technical details",
-            "- Format responses with clear hierarchy: Main solution → Steps → Verification → Alternatives",
-            "- ALWAYS ask customer to try the solution and report back",
-            "",
-            "CONFIDENCE GUIDELINES:",
-            "- High confidence (0.8+): Solution is complete, actionable, and from reliable sources",
-            "- Medium confidence (0.6-0.8): Solution is likely correct but may need verification",
-            "- Low confidence (<0.6): Information is incomplete but still provide helpful guidance",
-            "- Even with low confidence, give customers actionable steps they can try",
-            "- Keep all confidence calculations internal - never show them to customers",
-            "",
-        ]
 
-        # Add special instructions for agent requests
-        if is_agent_request:
-            prompt_parts.extend([
-                "SPECIAL INSTRUCTIONS FOR AGENT REQUESTS:",
-                "- The customer requested to speak to a human agent.",
-                "- However, if the issue is simple and well-documented in the knowledge base,",
-                "  provide the complete solution and explain that you can handle this.",
-                "- Only escalate to staff if the issue is truly complex or not in the knowledge base.",
-                "- Be empathetic but efficient - don't escalate unnecessarily.",
-                "",
-            ])
-        
-        # Add knowledge base context
-        if kb_context:
-            prompt_parts.extend([
-                "KNOWLEDGE BASE CONTEXT:",
-                "-------------------",
-            ])
-            for i, result in enumerate(kb_context, 1):
-                prompt_parts.extend([
-                    f"Document {i} (relevance: {result.score:.2f}):",
-                    result.content,
-                    "",
-                ])
-            prompt_parts.append("-------------------")
-        else:
-            prompt_parts.append("No relevant knowledge base context found for this query.")
-        
-        # Add customer context
-        if customer_account:
-            prompt_parts.extend([
-                "",
-                "CUSTOMER CONTEXT:",
-                f"- Customer ID: {customer_account.customer_id}",
-                f"- Name: {customer_account.name}",
-                f"- Email: {customer_account.email}",
-                f"- Plan: {customer_account.plan}",
-                "- Use this information to tailor your response to their specific situation",
-            ])
-        
-        prompt_parts.extend([
-            "",
-            "Based on the above context, provide a complete, actionable solution to the customer's issue.",
-            "Focus on giving them steps they can take right now to solve their problem.",
-        ])
-        
-        return "\n".join(prompt_parts)
 
-    async def _analyze_complexity(
+    @lru_cache(maxsize=100)
+    def _analyze_complexity_cached(
         self,
         message: str,
-        kb_context: List[SearchResult],
-        conversation_history: List,
+        has_kb_context: bool,
+        history_length: int,
     ) -> Dict[str, Any]:
         """
-        Analyze if an issue is complex enough to require human intervention.
-
-        Optimized to reduce false escalations and maximize AI resolution rate.
-
-        Complexity factors:
-        1. No knowledge base match (issue not documented) - lowered weight
-        2. Long conversation history (multiple failed attempts) - increased threshold
-        3. Emotional language (frustration indicators) - kept
-        4. Multiple topics/issues in one message - kept
-        5. Account-specific issues (billing, plan changes, etc.) - lowered weight
-
-        Returns:
-            Dict with keys: is_complex, complexity_score, reasons
+        Cached version of complexity analysis for frequently seen messages.
         """
         complexity_score = 0.0
         reasons = []
 
-        # Factor 1: No knowledge base match. Issues not in knowledge base should be escalated
-        # as they may require investigation or specialized knowledge.
-        if not kb_context:
-            complexity_score += 0.7  # Increased from 0.25 to ensure escalation for unknown issues
+        # Factor 1: No knowledge base match
+        if not has_kb_context:
+            complexity_score += 0.7
             reasons.append("No knowledge base match - issue not documented, requires human investigation")
 
-        # Factor 2: Long conversation history (increased threshold from 5 to 8)
-        if len(conversation_history) > 8:
+        # Factor 2: Long conversation history
+        if history_length > 8:
             complexity_score += 0.3
-            reasons.append(f"Long conversation history ({len(conversation_history)} messages)")
+            reasons.append(f"Long conversation history ({history_length} messages)")
 
-        # Factor 3: Emotional language (frustration indicators) - kept
+        # Factor 3: Emotional language
         frustration_indicators = [
             "frustrated", "angry", "upset", "annoyed", "disappointed",
             "not working", "still broken", "never works", "again",
@@ -934,75 +2174,37 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                 reasons.append(f"Frustration detected: '{indicator}'")
                 break
 
-        # Factor 4: Multiple topics/issues in one message - kept
+        # Factor 4: Multiple topics
         topic_indicators = ["and", "also", "plus", "another", "additionally"]
         topic_count = sum(1 for indicator in topic_indicators if indicator in message_lower)
         if topic_count >= 2:
-            complexity_score += 0.15
-            reasons.append("Multiple topics/issues detected in message")
+            complexity_score += 0.2
+            reasons.append(f"Multiple topics detected ({topic_count} topic indicators)")
 
-        # Factor 5: Account-specific issues (lowered from 0.1 to 0.05)
-        # Removed generic terms like "payment", "account" that don't indicate complexity
-        account_keywords = [
-            "billing", "invoice", "charge", "refund",
-            "plan", "subscription", "upgrade", "downgrade", "cancel",
-            "profile", "settings", "user"
-        ]
-        for keyword in account_keywords:
-            if keyword in message_lower:
-                complexity_score += 0.05
-                reasons.append(f"Account-specific issue: '{keyword}'")
-                break
+        # Determine if complex - lowered threshold to catch novel undocumented issues
+        # A calm, novel, undocumented issue (0.7 from no KB match) should still escalate
+        is_complex = complexity_score >= 0.7  # Lowered from 0.8 to catch novel issues
 
-        # Factor 6: Issues that require investigation or a staff-controlled
-        # action. These cannot be safely resolved from general KB instructions.
-        # However, if KB content exists for payment issues, allow AI to handle them.
-        staff_only_indicators = [
-            "charged twice", "unauthorized charge", "refund missing",
-            "account locked", "account hacked", "security breach", "data loss",
-            "cannot access", "outage", "production down", "server error", "500",
-            "bug report", "integration failing", "api error", "legal", "complaint",
-            "security vulnerability", "security issue", "security report", "vulnerability",
-            "hack", "breach", "compromise", "exploit", "attack"
-        ]
-        
-        # Payment-related issues that can be handled with good KB content
-        payment_troubleshooting_indicators = ["payment failed", "payment declined", "card declined"]
-        
-        for indicator in staff_only_indicators:
-            if indicator in message_lower:
-                complexity_score += 0.65
-                reasons.append(f"Requires staff investigation: '{indicator}'")
-                break
-        
-        # Special handling for payment issues: only escalate if KB content is poor
-        for indicator in payment_troubleshooting_indicators:
-            if indicator in message_lower:
-                # Check if we have good KB content for payment troubleshooting
-                has_payment_kb = any(
-                    "payment" in result.content.lower() and result.score >= 0.7
-                    for result in kb_context
-                )
-                
-                if not has_payment_kb:
-                    complexity_score += 0.4
-                    reasons.append(f"Payment issue without KB guidance: '{indicator}'")
-                else:
-                    # Good KB content exists, let AI handle it
-                    complexity_score += 0.1  # Small increase for payment complexity
-                    reasons.append(f"Payment issue with KB support: '{indicator}'")
-                break
+        return {
+            "is_complex": is_complex,
+            "complexity_score": complexity_score,
+            "reasons": reasons
+        }
 
-        # A staff-only signal is intentionally enough to escalate immediately;
-        # otherwise require several signals to avoid routing ordinary KB questions.
-        # Lowered threshold to 0.6 to ensure unknown issues (0.7 score) are escalated
-        is_complex = complexity_score >= 0.6
-
-        logger.debug(
-            "Complexity analysis completed",
-            complexity_score=complexity_score,
-            is_complex=is_complex,
-            reasons=reasons,
+    async def _analyze_complexity(
+        self,
+        message: str,
+        kb_context: List[SearchResult],
+        conversation_history: List,
+    ) -> Dict[str, Any]:
+        """
+        Analyze if an issue is complex enough to require human intervention.
+        This is now a simple wrapper around the cached version for compatibility.
+        """
+        return self._analyze_complexity_cached(
+            message=message,
+            has_kb_context=len(kb_context) > 0,
+            history_length=len(conversation_history),
         )
 
         return {
@@ -1039,33 +2241,70 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
             f"Total Messages: {len(conversation_history)}",
             f"Escalation Reason: {escalation_reason}",
             "",
+            LANGUAGE_POLICY,
+            "",
             "=== CUSTOMER ISSUE ANALYSIS ===",
         ]
 
         # Get customer's initial message and classify the issue
         if conversation_history:
             first_message = conversation_history[0]
-            if first_message.sender == MessageSender.CUSTOMER:
-                summary_parts.append(f"Initial Issue: {first_message.content[:200]}...")
-                
-                # Classify issue type
-                issue_content = first_message.content.lower()
-                issue_type = "General Support"
-                if "password" in issue_content or "login" in issue_content:
-                    issue_type = "Account Access"
-                elif "billing" in issue_content or "payment" in issue_content:
-                    issue_type = "Billing/Payment"
-                elif "error" in issue_content or "crash" in issue_content or "500" in issue_content:
-                    issue_type = "Technical Error"
-                elif "delivery" in issue_content or "shipping" in issue_content:
-                    issue_type = "Order/Shipping"
-                
-                summary_parts.append(f"Classified Issue Type: {issue_type}")
+            # Check if it's a database object or ChatMessage format
+            if hasattr(first_message, 'sender') and not hasattr(first_message, 'role'):
+                # Database object format (has sender but not role)
+                if first_message.sender == MessageSender.CUSTOMER:
+                    summary_parts.append(f"Initial Issue: {first_message.content[:200]}...")
+                    
+                    # Classify issue type
+                    issue_content = first_message.content.lower()
+                    issue_type = "General Support"
+                    if "password" in issue_content or "login" in issue_content:
+                        issue_type = "Account Access"
+                    elif "billing" in issue_content or "payment" in issue_content:
+                        issue_type = "Billing/Payment"
+                    elif "error" in issue_content or "crash" in issue_content or "500" in issue_content:
+                        issue_type = "Technical Error"
+                    elif "delivery" in issue_content or "shipping" in issue_content:
+                        issue_type = "Order/Shipping"
+                    
+                    summary_parts.append(f"Classified Issue Type: {issue_type}")
+            else:
+                # ChatMessage format
+                if first_message.role == "user":
+                    summary_parts.append(f"Initial Issue: {first_message.content[:200]}...")
+                    
+                    # Classify issue type
+                    issue_content = first_message.content.lower()
+                    issue_type = "General Support"
+                    if "password" in issue_content or "login" in issue_content:
+                        issue_type = "Account Access"
+                    elif "billing" in issue_content or "payment" in issue_content:
+                        issue_type = "Billing/Payment"
+                    elif "error" in issue_content or "crash" in issue_content or "500" in issue_content:
+                        issue_type = "Technical Error"
+                    elif "delivery" in issue_content or "shipping" in issue_content:
+                        issue_type = "Order/Shipping"
+                    
+                    summary_parts.append(f"Classified Issue Type: {issue_type}")
 
         # Count messages by sender
-        customer_messages = [m for m in conversation_history if m.sender == MessageSender.CUSTOMER]
-        ai_messages = [m for m in conversation_history if m.sender == MessageSender.SUPPORT_AI]
-        system_messages = [m for m in conversation_history if m.sender == MessageSender.SYSTEM]
+        # Categorize messages by sender/role
+        if conversation_history:
+            # Check if history contains ChatMessage format (role/content) or database objects (sender)
+            if hasattr(conversation_history[0], 'role'):
+                # ChatMessage format from Shiva Support
+                customer_messages = [m for m in conversation_history if m.role == "user"]
+                ai_messages = [m for m in conversation_history if m.role == "assistant"]
+                system_messages = [m for m in conversation_history if m.role == "system"]
+            elif hasattr(conversation_history[0], 'sender'):
+                # Database object format
+                customer_messages = [m for m in conversation_history if hasattr(m, 'sender') and m.sender == MessageSender.CUSTOMER]
+                ai_messages = [m for m in conversation_history if hasattr(m, 'sender') and m.sender == MessageSender.SUPPORT_AI]
+                system_messages = [m for m in conversation_history if hasattr(m, 'sender') and m.sender == MessageSender.SYSTEM]
+        else:
+            customer_messages = []
+            ai_messages = []
+            system_messages = []
 
         summary_parts.extend([
             f"Customer Messages: {len(customer_messages)}",
@@ -1089,7 +2328,14 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
             # Analyze what solutions AI provided
             solutions_attempted = []
             for ai_msg in ai_messages:
-                content_lower = ai_msg.content.lower()
+                # Check if it's a database object or ChatMessage format
+                if hasattr(ai_msg, 'sender'):
+                    # Database object format
+                    content_lower = ai_msg.content.lower()
+                else:
+                    # ChatMessage format
+                    content_lower = ai_msg.content.lower()
+                    
                 if "step" in content_lower or "follow" in content_lower:
                     solutions_attempted.append("Step-by-step instructions")
                 if "settings" in content_lower or "button" in content_lower:
@@ -1104,11 +2350,36 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
             
             # Last AI response analysis
             last_ai_response = ai_messages[-1]
-            summary_parts.append(f"Final AI Response: {last_ai_response.content[:200]}...")
+            # Check if it's a database object or ChatMessage format
+            if hasattr(last_ai_response, 'sender'):
+                # Database object format
+                summary_parts.append(f"Final AI Response: {last_ai_response.content[:200]}...")
+            else:
+                # ChatMessage format
+                summary_parts.append(f"Final AI Response: {last_ai_response.content[:200]}...")
             
             # Check if AI provided incomplete solution
             if len(ai_messages) > 1:
                 summary_parts.append("Note: Multiple AI attempts suggest incomplete or unclear guidance provided.")
+            
+            # Detect failure indicators from customer follow-ups
+            if len(customer_messages) > 1:
+                summary_parts.append("=== WHY AI SOLUTIONS FAILED ===")
+                failure_indicators = []
+                for msg in customer_messages[1:]:  # Skip initial message
+                    content_lower = msg.content.lower()
+                    if "doesn't work" in content_lower or "didn't work" in content_lower or "still" in content_lower:
+                        failure_indicators.append("Customer reported solution didn't work")
+                    if "error" in content_lower:
+                        failure_indicators.append("Customer encountering errors")
+                    if "confused" in content_lower or "unclear" in content_lower:
+                        failure_indicators.append("Customer found instructions unclear")
+                
+                if failure_indicators:
+                    for indicator in set(failure_indicators):
+                        summary_parts.append(f"- {indicator}")
+                else:
+                    summary_parts.append("- Customer continued asking questions, suggesting AI solution was insufficient")
             summary_parts.append("")
 
         # Identify what's missing for resolution
@@ -1171,8 +2442,23 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                     content=result["response"],
                 )
 
+                # Increment AI attempts counter on the ticket
+                await ticket_service.increment_ai_attempts(ticket_id)
+
                 # Store AI confidence before auto-resolving
                 await ticket_service.store_ai_confidence(ticket_id, result["confidence"])
+
+                # Store AI resolution metadata for analytics
+                agent_type = result.get("metadata", {}).get("agent_used") if result.get("metadata") else None
+                kb_similarity = result.get("kb_similarity_score")
+                kb_article_ids = result.get("kb_article_ids")
+                
+                await ticket_service.store_ai_resolution_metadata(
+                    ticket_id=ticket_id,
+                    agent_type=agent_type,
+                    kb_article_ids=kb_article_ids,
+                    kb_similarity_score=kb_similarity,
+                )
 
                 # Auto-resolve the ticket if confident
                 await ticket_service.resolve_auto(ticket_id)
@@ -1201,10 +2487,14 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
         else:
             # Queue for staff with chat summary (only if ticket_service exists)
             if ticket_service:
-                if result.get("complexity_analysis") and result["complexity_analysis"]["is_complex"]:
-                    reason = f"Complex issue detected: {', '.join(result['complexity_analysis']['reasons'])}"
-                else:
-                    reason = result.get("error", "Low confidence in AI response")
+                # Use the actual escalation reason from handle_customer_message
+                reason = result.get("escalation_reason")
+                if not reason:
+                    # Fallback to complexity analysis if escalation_reason not available
+                    if result.get("complexity_analysis") and result["complexity_analysis"]["is_complex"]:
+                        reason = f"Complex issue detected: {', '.join(result['complexity_analysis']['reasons'])}"
+                    else:
+                        reason = result.get("error", "Low confidence in AI response")
 
                 # Generate chat summary before queuing
                 conversation_history = await ticket_service.get_ticket_messages(ticket_id)
@@ -1212,6 +2502,25 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                     ticket_id=ticket_id,
                     conversation_history=conversation_history,
                     escalation_reason=reason,
+                )
+
+                # Store AI's solution as staff-only artifact
+                await ticket_service.create_ai_suggested_resolution(
+                    ticket_id=ticket_id,
+                    suggested_solution=result.get("response", ""),
+                    confidence=result.get("confidence", 0.0),
+                    escalation_reason=reason,
+                    kb_article_ids=result.get("kb_article_ids"),
+                    kb_similarity_score=result.get("kb_similarity_score"),
+                    agent_type=result.get("metadata", {}).get("agent_used") if result.get("metadata") else None,
+                )
+
+                # Send customer-facing status message (not the AI's technical solution)
+                customer_status_message = self._generate_escalation_status_message(message)
+                await ticket_service.append_message(
+                    ticket_id=ticket_id,
+                    sender=MessageSender.SUPPORT_AI,
+                    content=customer_status_message,
                 )
 
                 await ticket_service.queue_for_staff(ticket_id, reason, chat_summary)
@@ -1225,6 +2534,23 @@ Respond with ONLY "IN-SCOPE" or "OUT-OF-SCOPE" (no explanation needed)."""
                     confidence=result["confidence"],
                     is_agent_request=is_agent_request,
                     summary_length=len(chat_summary),
+                    stored_ai_solution=True,
                 )
 
             return False
+
+    def _generate_escalation_status_message(self, original_message: str) -> str:
+        """
+        Generate a customer-facing status message for escalation.
+        
+        This is a short, honest acknowledgment that the issue has been escalated
+        to staff. It does NOT include the AI's technical diagnosis or proposed solution.
+        """
+        # Detect if the message is in Kiswahili to respond in the same language
+        kiswahili_indicators = ["hii", "hiyo", "haya", "naumwa", "tatizo", "haifanyi kazi", "nisaidie"]
+        is_kiswahili = any(indicator in original_message.lower() for indicator in kiswahili_indicators)
+        
+        if is_kiswahili:
+            return "Asante kwa maelezo - hii inahitiliangilia zaidi kutoka kwa timu yetu, hivyo nimeirusha kwa mtaalamu. Watafuatilia tiketi hii hivi karibuni."
+        else:
+            return "Thanks for the details — this needs a closer look from our team, so I've escalated it to a specialist. They'll follow up on this ticket shortly."

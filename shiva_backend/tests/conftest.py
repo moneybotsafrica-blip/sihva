@@ -106,45 +106,4 @@ def mock_developer_user():
     )
 
 
-@pytest.fixture
-async def mock_seeded_db(async_session):
-    """Create a database session seeded with mock data."""
-    from app.db.mock_db import seed_mock_database
-    
-    await seed_mock_database(async_session)
-    yield async_session
-    
-    # Clean up after test
-    from app.db.mock_db import clear_mock_database
-    await clear_mock_database(async_session)
 
-
-@pytest.fixture
-def mock_database():
-    """Get the MockDatabase class for creating test data."""
-    from app.db.mock_db import MockDatabase
-    return MockDatabase
-
-
-@pytest.fixture
-def sample_support_ticket(mock_database):
-    """Create a sample support ticket for testing."""
-    return mock_database.create_complete_support_ticket()
-
-
-@pytest.fixture
-def sample_bug_ticket(mock_database):
-    """Create a sample bug ticket for testing."""
-    return mock_database.create_complete_bug_ticket()
-
-
-@pytest.fixture
-def sample_auto_resolved_ticket(mock_database):
-    """Create a sample auto-resolved ticket for testing."""
-    return mock_database.create_auto_resolved_ticket()
-
-
-@pytest.fixture
-def sample_closed_ticket(mock_database):
-    """Create a sample closed ticket for testing."""
-    return mock_database.create_closed_ticket()

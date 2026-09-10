@@ -1,8 +1,9 @@
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, AsyncIterator
 from dataclasses import dataclass
 import httpx
 import structlog
+import json
 
 from app.config import settings
 
@@ -36,8 +37,33 @@ class GroqClientInterface(ABC):
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
         """Generate chat completion using Groq LLM."""
+        pass
+
+    @abstractmethod
+    async def chat_completion_stream(
+        self,
+        messages: List[ChatMessage],
+        model: Optional[str] = None,
+        temperature: float = 0.7,
+        max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Generate streaming chat completion using Groq LLM."""
+        pass
+
+    @abstractmethod
+    async def should_escalate(
+        self,
+        message: str,
+        response: str,
+        kb_context: str,
+        conversation_history: List,
+        customer_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Determine if conversation should be escalated to human agent."""
         pass
 
 
@@ -53,7 +79,7 @@ class GroqClient(GroqClientInterface):
         self.model = model or settings.groq_model
         self.client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {self.api_key}"},
-            timeout=60.0,
+            timeout=30.0,  # Reduced from 60.0 for faster responses
         )
 
     async def chat_completion(
@@ -62,44 +88,20 @@ class GroqClient(GroqClientInterface):
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> LLMResponse:
         """Generate chat completion using Groq API."""
         model = model or self.model
 
         try:
-            payload = {
-                "model": model,
-                "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
-                "temperature": temperature,
-            }
-
-            if max_tokens:
-                payload["max_tokens"] = max_tokens
-
-            response = await self.client.post(
-                "https://api.groq.com/openai/v1/chat/completions",
-                json=payload,
+            response = await self._chat_completion_with_retry(
+                messages=messages,
+                model=model,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
             )
-            response.raise_for_status()
-            data = response.json()
-
-            content = data["choices"][0]["message"]["content"]
-
-            # Extract confidence - Groq doesn't provide this directly, so we estimate based on response quality
-            # For now, use a reasonable default confidence
-            confidence = 0.8
-
-            # Adjust confidence based on response characteristics
-            if content and len(content) > 50:
-                confidence = min(0.9, confidence + 0.1)  # Longer responses tend to be more confident
-            if content and "i don't know" in content.lower() or "not sure" in content.lower():
-                confidence = max(0.3, confidence - 0.3)  # Uncertain responses have lower confidence
-
-            return LLMResponse(
-                content=content,
-                confidence=confidence,
-                metadata={"model": model, "usage": data.get("usage")},
-            )
+            return response
         except httpx.HTTPStatusError as e:
             logger.error(
                 "Groq API request failed",
@@ -114,263 +116,479 @@ class GroqClient(GroqClientInterface):
             )
             raise
 
-    async def close(self):
-        """Close the HTTP client."""
-        await self.client.aclose()
-
-
-class MockGroqClient(GroqClientInterface):
-    """Mock implementation for testing with knowledge base awareness."""
-
-    def __init__(self):
-        self.responses: Dict[str, LLMResponse] = {}
-
-    async def analyze_user_problem(self, user_input: str) -> Dict[str, Any]:
-        """Mock implementation of problem analysis."""
-        # Simple rule-based analysis for testing
-        user_input_lower = user_input.lower()
-        
-        if any(tech in user_input_lower for tech in ["error", "crash", "bug", "500", "404"]):
-            return {
-                "problem_type": "technical_issue",
-                "urgency": 4,
-                "summary": "Technical issue detected in user input",
-                "solution_approach": "Route to Code AI for analysis",
-                "confidence": 0.85
-            }
-        elif any(support in user_input_lower for support in ["password", "billing", "account", "delivery"]):
-            return {
-                "problem_type": "support_query",
-                "urgency": 2,
-                "summary": "General support query",
-                "solution_approach": "Route to Support AI with knowledge base",
-                "confidence": 0.90
-            }
-        else:
-            return {
-                "problem_type": "general",
-                "urgency": 3,
-                "summary": "General inquiry",
-                "solution_approach": "Handle with default support flow",
-                "confidence": 0.70
+    async def _chat_completion_with_retry(
+        self,
+        messages: List[ChatMessage],
+        model: str,
+        temperature: float,
+        max_tokens: Optional[int],
+        reasoning_effort: Optional[str],
+        retry_count: int = 0,
+    ) -> LLMResponse:
+        """Internal method with retry logic for truncation."""
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+                "temperature": temperature,
             }
 
-    def set_mock_response(self, key: str, response: LLMResponse):
-        """Set a mock response for testing."""
-        self.responses[key] = response
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
 
-    async def chat_completion(
+            # Add reasoning_effort for reasoning models
+            reasoning_models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+            if model in reasoning_models and reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
+
+            response = await self.client.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                timeout=20.0,
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            content = data["choices"][0]["message"]["content"]
+            finish_reason = data["choices"][0].get("finish_reason")
+
+            # Log warning and retry if truncated
+            if finish_reason == "length":
+                logger.warning(
+                    "Groq response truncated by max_tokens",
+                    model=model,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    finish_reason=finish_reason,
+                    response_length=len(content),
+                )
+                
+                # Retry once with doubled max_tokens (capped at 2000)
+                if retry_count == 0 and max_tokens:
+                    new_max_tokens = min(max_tokens * 2, 2000)
+                    logger.info(
+                        "Retrying with doubled max_tokens",
+                        original_max_tokens=max_tokens,
+                        new_max_tokens=new_max_tokens,
+                    )
+                    return await self._chat_completion_with_retry(
+                        messages=messages,
+                        model=model,
+                        temperature=temperature,
+                        max_tokens=new_max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        retry_count=retry_count + 1,
+                    )
+
+            # Extract confidence
+            confidence = 0.8
+            if content and len(content) > 50:
+                confidence = min(0.9, confidence + 0.1)
+            if content and "i don't know" in content.lower() or "not sure" in content.lower():
+                confidence = max(0.3, confidence - 0.3)
+
+            return LLMResponse(
+                content=content,
+                confidence=confidence,
+                metadata={"model": model, "usage": data.get("usage"), "finish_reason": finish_reason},
+            )
+
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "Groq API request failed",
+                status_code=e.response.status_code,
+                error=str(e),
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "Error calling Groq API",
+                error=str(e),
+            )
+            raise
+
+    async def chat_completion_stream(
         self,
         messages: List[ChatMessage],
         model: Optional[str] = None,
         temperature: float = 0.7,
         max_tokens: Optional[int] = None,
-    ) -> LLMResponse:
-        """Return mock response based on input and knowledge base context."""
-        # Extract system prompt for knowledge base context
-        system_message = next((msg for msg in messages if msg.role == "system"), None)
-        kb_context = ""
-        if system_message:
-            # Extract knowledge base content from system prompt
-            if "KNOWLEDGE BASE CONTEXT:" in system_message.content:
-                kb_section = system_message.content.split("KNOWLEDGE BASE CONTEXT:")[1]
-                if "-------------------" in kb_section:
-                    kb_content = kb_section.split("-------------------")[0]
-                    kb_context = kb_content.strip()
+        reasoning_effort: Optional[str] = None,
+    ) -> AsyncIterator[str]:
+        """Generate streaming chat completion using Groq API."""
+        model = model or self.model
 
-        # Get the latest user message
-        user_messages = [msg for msg in messages if msg.role == "user"]
-        if not user_messages:
-            return LLMResponse(
-                content="I couldn't understand your request.",
-                confidence=0.3,
-            )
-        
-        user_message = user_messages[-1].content.lower()
+        try:
+            payload = {
+                "model": model,
+                "messages": [{"role": msg.role, "content": msg.content} for msg in messages],
+                "temperature": temperature,
+                "stream": True,
+            }
 
-        # Check for predefined mock responses first
-        for key, response in self.responses.items():
-            if key.lower() in user_message:
-                return response
+            if max_tokens:
+                payload["max_tokens"] = max_tokens
 
-        # Generate response based on knowledge base context
-        if kb_context:
-            # For testing purposes, provide enhanced step-by-step responses for diverse categories
-            if "password" in user_message:
-                enhanced_response = "To reset your password, follow these steps: Step 1: Go to Settings by clicking the gear icon. Step 2: Select Security from the menu. Step 3: Click on 'Change Password'. Step 4: Enter your current password. Step 5: Enter your new password. Step 6: Click 'Confirm'. Step 7: Check your email for verification link. Step 8: Click the link within 24 hours. You should see a confirmation message: 'Password successfully reset'."
-                return LLMResponse(content=enhanced_response, confidence=0.95)
-            elif "billing" in user_message or "payment" in user_message or "pay" in user_message or "charge" in user_message or "invoice" in user_message:
-                enhanced_response = "To resolve payment issues, follow these steps: Step 1: Check your payment method details in Settings > Billing. Step 2: Verify your card has sufficient funds and isn't expired. Step 3: Ensure billing address matches your card statement. Step 4: Try a different payment method (credit card, PayPal). Step 5: Clear browser cache and try incognito mode. Step 6: Disable VPN or proxy temporarily. Step 7: Check if the payment gateway is experiencing issues. Step 8: Contact your bank to authorize the transaction. If issues persist, the payment will be processed within 24-48 hours. You should see a confirmation email and receipt once successful."
-                return LLMResponse(content=enhanced_response, confidence=0.92)
-            elif "account" in user_message or "access" in user_message:
-                enhanced_response = "If you can't access your account: Step 1: Try the password reset option first. Step 2: Check your email for password reset link (check spam folder). Step 3: If link doesn't work, request a new reset link. Step 4: Clear browser cache and cookies. Step 5: Try a different browser or incognito mode. Step 6: If still blocked, contact support with your account details and email address."
-                return LLMResponse(content=enhanced_response, confidence=0.88)
-            elif "error" in user_message or "500" in user_message or "404" in user_message:
-                enhanced_response = "For 500 Internal Server Error: Step 1: Refresh the page (F5 or Ctrl+R). Step 2: Check your internet connection. Step 3: Clear browser cache and cookies. Step 4: Try a different browser. Step 5: Check if other users are experiencing the same issue. Step 6: If error persists, note the exact time, page URL, and error message. Step 7: Contact support with these details for faster resolution."
-                return LLMResponse(content=enhanced_response, confidence=0.85)
-            elif "feature" in user_message or "report" in user_message or "export" in user_message:
-                enhanced_response = "To use reporting features: Step 1: Navigate to Reports section in main menu. Step 2: Select report type from dropdown. Step 3: Set date range and filters. Step 4: Click 'Generate Report' button. Step 5: Wait for processing (usually 10-30 seconds). Step 6: Review report in preview pane. Step 7: Click 'Export' to download (PDF, CSV, Excel options). Step 8: Save report to desired location."
-                return LLMResponse(content=enhanced_response, confidence=0.90)
-            elif "subscription" in user_message or "plan" in user_message or "upgrade" in user_message:
-                enhanced_response = "To manage subscription: Step 1: Go to Settings > Subscription. Step 2: View current plan details and billing cycle. Step 3: To upgrade, click 'Change Plan' and select new tier. Step 4: To cancel, click 'Cancel Subscription' and confirm. Step 5: For refunds, contact support within 30 days. Step 6: Plan changes take effect immediately for upgrades, next cycle for downgrades."
-                return LLMResponse(content=enhanced_response, confidence=0.87)
-            elif "data" in user_message or "export" in user_message or "import" in user_message:
-                enhanced_response = "To export your data: Step 1: Navigate to Settings > Data Management. Step 2: Click 'Export Data' button. Step 3: Select data types to export (messages, files, settings). Step 4: Choose export format (CSV, JSON, PDF). Step 5: Click 'Start Export'. Step 6: Wait for completion notification. Step 7: Download exported file from notification. Step 8: Verify data integrity."
-                return LLMResponse(content=enhanced_response, confidence=0.86)
-            elif "security" in user_message or "2fa" in user_message or "auth" in user_message:
-                enhanced_response = "To enhance account security: Step 1: Go to Settings > Security. Step 2: Enable two-factor authentication (2FA). Step 3: Choose 2FA method (SMS, authenticator app, hardware key). Step 4: Verify 2FA setup with backup codes. Step 5: Set strong password (12+ characters, mixed types). Step 6: Enable login notifications. Step 7: Review connected devices and remove unknown ones."
-                return LLMResponse(content=enhanced_response, confidence=0.91)
-            elif "api" in user_message or "integration" in user_message or "webhook" in user_message:
-                enhanced_response = "To integrate with API: Step 1: Go to Settings > API Keys. Step 2: Click 'Generate New API Key'. Step 3: Set key permissions and scope. Step 4: Copy API key (store securely, not shown again). Step 5: Review API documentation in Developer Portal. Step 6: Test API endpoints using provided sandbox. Step 7: Implement webhook handlers for events. Step 8: Set up rate limiting alerts."
-                return LLMResponse(content=enhanced_response, confidence=0.84)
-            else:
-                response = self._generate_kb_response(user_message, kb_context)
-                return response
+            # Add reasoning_effort for reasoning models
+            reasoning_models = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"]
+            if model in reasoning_models and reasoning_effort:
+                payload["reasoning_effort"] = reasoning_effort
 
-        # Fallback responses based on common queries - enhanced to prevent user frustration
-        # Check for greetings first
-        if any(greeting in user_message for greeting in ["hi", "hello", "hey"]):
-            return LLMResponse(
-                content="I am here to help with any Shiva-related questions or issues you might have—feel free to ask about your account, service, payments, or anything else Shivasoftwares! What can I assist with today?",
-                confidence=0.95,
-            )
-        elif "password" in user_message:
-            return LLMResponse(
-                content="I can help you reset your password. Here's what to do: Step 1: Go to Settings by clicking the gear icon. Step 2: Select Security from the menu. Step 3: Click 'Change Password'. Step 4: Enter your current password. Step 5: Create a new password (8+ characters with letters and numbers). Step 6: Click 'Confirm'. Step 7: Check your email for a verification link and click it within 24 hours. You should see 'Password successfully reset' when done. If you don't receive the email, check your spam folder or request a new link.",
-                confidence=0.92,
-            )
-        elif "billing" in user_message or "payment" in user_message or "pay" in user_message:
-            return LLMResponse(
-                content="I understand payment issues can be frustrating. Let me help you resolve this: Step 1: Go to Settings > Billing to check your payment method. Step 2: Verify your card has funds and isn't expired. Step 3: Ensure your billing address matches your card statement. Step 4: Try a different payment method (credit card, PayPal). Step 5: Clear your browser cache and try incognito mode. Step 6: Disable VPN temporarily as it can block payments. Step 7: Contact your bank to authorize the transaction if needed. Most payment issues resolve within 24-48 hours. You'll receive a confirmation email when successful. If you're still having trouble after trying these steps, I can help you contact support with specific details.",
-                confidence=0.88,
-            )
-        elif "delivery" in user_message or "shipping" in user_message:
-            return LLMResponse(
-                content="I can help you with delivery information. Standard delivery takes 3-5 business days. Express delivery is available for 1-2 business days. International orders may have customs delays. To track your order: Step 1: Go to Orders > Select Your Order. Step 2: Click 'Track Package'. Step 3: Enter your tracking number if needed. Step 4: You'll see the current location and estimated delivery date. If your order is delayed beyond the estimated date, contact support with your order number for investigation.",
-                confidence=0.85,
-            )
-        elif "account" in user_message or "login" in user_message:
-            structured_response = """**Solution – Resolve Login Problems on Shiva AI Platform**
-
-1. **Confirm Username & Password**
-   - Verify you are entering the exact email address used for registration (case‑insensitive) and the correct password.
-   - Watch for accidental leading/trailing spaces; type the credentials manually instead of copy‑pasting.
-
-2. **Reset Your Password**
-   - On the login page click **"Forgot password?"**.
-   - Enter your registered email address and press **"Send Reset Link"**.
-   - Check your inbox (and spam folder) for the reset email, click the link, and set a new password that meets the platform's complexity rules (minimum 8 characters, includes a letter, number, and special character).
-   - Return to the login page and sign in with the new password.
-
-3. **Verify Account Status**
-   - If you never received the reset email, your account may be unverified or disabled.
-   - Locate the original **"Welcome – Verify Your Email"** message sent after registration. Click the verification link inside.
-   - If the account was disabled (e.g., due to multiple failed attempts), you'll see a banner on the login screen. Click **"Contact Support"** from that banner to request re‑activation.
-
-4. **Clear Browser Cache & Cookies**
-   - Open your browser settings → **Privacy & Security** → **Clear browsing data**.
-   - Select **Cookies and other site data** and **Cached images and files** for the time range "All time".
-   - Reload the Shiva AI login page and try again.
-
-5. **Try a Different Browser or Incognito/Private Mode**
-   - Open Chrome/Edge/Firefox in **Incognito/Private** mode and navigate to the login URL.
-   - This bypasses extensions or stored cookies that might interfere.
-
-6. **Check Two‑Factor Authentication (2FA)**
-   - If you have 2FA enabled, after entering your password you'll be prompted for a code.
-   - Open your authenticator app (Google Authenticator, Authy, etc.) and enter the 6‑digit code.
-   - If you cannot access the authenticator, click **"Lost access to 2FA?"** on the 2FA screen and follow the recovery steps (email verification or backup codes).
-
-7. **Network Restrictions**
-   - Ensure you are not behind a corporate firewall or VPN that blocks Shiva AI domains.
-   - Temporarily disable VPN or switch to a different network (e.g., mobile hotspot) and attempt login again.
-
-8. **Account Lockout After Repeated Failures**
-   - After 5 consecutive failed attempts the account locks for 15 minutes.
-   - Wait the lockout period, then retry with the correct credentials or use the password‑reset link.
-
-9. **Verify Browser Compatibility**
-   - Shiva AI supports the latest versions of Chrome, Edge, and Firefox.
-   - Update your browser to the newest version if it is outdated.
-
-10. **Confirm URL**
-    - Make sure you are accessing the official login page: `https://app.shivaai.com/login` 
-    - Avoid bookmarked or third‑party links that may redirect to old or phishing pages.
-
-**How to Verify Success**
-- After completing the steps, you should land on the **Dashboard** showing your projects and the top navigation bar.
-- The URL will change to `https://app.shivaai.com/dashboard`.
-- No error messages should appear; if a welcome banner shows "You are logged in as Alice Johnson", the issue is resolved.
-
-**If the Issue Persists – Alternatives**
-- **Use a Different Device** (mobile phone, tablet, another computer) to rule out device‑specific problems.
-- **Check Email for Account Notices** – any suspension or verification notices will be sent to your registered email.
-- **Run a Browser Extension Test** – disable all extensions, especially ad‑blockers or security plugins, then retry.
-
-**Next Steps if Still Unresolved**
-- Gather the following information before contacting support:
-  1. Email address used for the account.
-  2. Exact error message displayed (screenshot if possible).
-  3. Browser name and version.
-  4. Whether 2FA is enabled.
-  5. Any recent changes to your account (password change, new device, etc.).
-
-- Reach out to Shiva AI Support via **support@shivaai.com** or the in‑app **Help → Contact Support** form, attaching the details above. This will allow the support team to diagnose the problem quickly."""
-            
-            return LLMResponse(
-                content=structured_response,
-                confidence=0.87,
-            )
-        elif "checkout" in user_message or "cart" in user_message:
-            return LLMResponse(
-                content="I can help you complete your purchase. Here's how: Step 1: Add items to your cart by clicking 'Add to Cart'. Step 2: Review your cart and click 'Checkout'. Step 3: Enter your shipping information. Step 4: Select your payment method (credit card, PayPal, etc.). Step 5: Enter payment details and billing address. Step 6: Review your order and click 'Place Order'. Step 7: You should see a confirmation page and receive an email receipt. If payment fails, try a different payment method or contact your bank. If you encounter any errors during checkout, note the error message and try refreshing the page.",
-                confidence=0.89,
-            )
-        else:
-            # For unknown issues, return a response that indicates need for staff assistance
-            return LLMResponse(
-                content="I don't have specific information about this issue in my knowledge base. This appears to be a complex or unique situation that would benefit from personalized assistance. I recommend contacting our support team directly with details about what you're experiencing, including any error messages or screenshots if available. They'll be able to provide more targeted help for your specific situation.",
-                confidence=0.3,
-            )
-
-    def _generate_kb_response(self, user_message: str, kb_context: str) -> LLMResponse:
-        """Generate a response based on knowledge base context."""
-        # Extract relevant information from KB context
-        user_message_lower = user_message.lower()
-        
-        # Look for relevant content in the knowledge base
-        if "password" in user_message_lower and "password" in kb_context.lower():
-            # Extract password-related instructions
-            lines = kb_context.split('\n')
-            for line in lines:
-                if "password" in line.lower() and ("reset" in line.lower() or "change" in line.lower()):
-                    return LLMResponse(
-                        content=f"{line.strip()}",
-                        confidence=0.90,
+            async with self.client.stream(
+                "POST",
+                "https://api.groq.com/openai/v1/chat/completions",
+                json=payload,
+                timeout=60.0,
+            ) as response:
+                response.raise_for_status()
+                
+                finish_reason = None
+                async for line in response.aiter_lines():
+                    if line.startswith("data: "):
+                        data_str = line[6:]
+                        
+                        if data_str == "[DONE]":
+                            break
+                        
+                        try:
+                            data = json.loads(data_str)
+                            if "choices" in data and len(data["choices"]) > 0:
+                                finish_reason = data["choices"][0].get("finish_reason")
+                                
+                                delta = data["choices"][0].get("delta", {})
+                                content = delta.get("content", "")
+                                if content:
+                                    yield content
+                        except json.JSONDecodeError:
+                            continue
+                
+                # Log warning if stream was truncated
+                if finish_reason == "length":
+                    logger.warning(
+                        "Groq streaming response truncated by max_tokens",
+                        model=model,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        finish_reason=finish_reason,
                     )
+                            
+        except httpx.HTTPStatusError as e:
+            logger.error(
+                "Groq API streaming request failed",
+                status_code=e.response.status_code,
+                error=str(e),
+            )
+            raise
+        except Exception as e:
+            logger.error(
+                "Error calling Groq API streaming",
+                error=str(e),
+            )
+            raise
+
+    async def close(self):
+        """Close the HTTP client."""
+        await self.client.aclose()
+
+    async def is_out_of_scope(
+        self,
+        message: str,
+        kb_context: str,
+        customer_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ask Groq to determine if a question is out-of-scope based on KB context.
         
-        if "payment" in user_message_lower or "checkout" in user_message_lower:
-            if "payment" in kb_context.lower() or "checkout" in kb_context.lower():
-                lines = kb_context.split('\n')
-                relevant_lines = [line for line in lines if any(word in line.lower() for word in ["payment", "checkout", "credit card", "paypal"])]
-                if relevant_lines:
-                    return LLMResponse(
-                        content=f"{' '.join(relevant_lines[:2])}",
-                        confidence=0.88,
-                    )
-        
-        if "delivery" in user_message_lower or "shipping" in user_message_lower:
-            if "delivery" in kb_context.lower() or "shipping" in kb_context.lower():
-                lines = kb_context.split('\n')
-                relevant_lines = [line for line in lines if any(word in line.lower() for word in ["delivery", "shipping", "business days"])]
-                if relevant_lines:
-                    return LLMResponse(
-                        content=f"{' '.join(relevant_lines[:2])}",
-                        confidence=0.85,
-                    )
-        
-        # General response if no specific match found but KB context exists
-        return LLMResponse(
-            content=f"Based on our knowledge base, here's the relevant information: {kb_context[:200]}...",
-            confidence=0.75,
-        )
+        Returns:
+            Dict with keys:
+            - is_out_of_scope: bool
+            - reasoning: str
+            - confidence: float
+        """
+        system_prompt = """You are a support AI for Shiva Software. Your task is to determine if a customer's question is within the scope of Shiva support services.
+
+Consider the question out-of-scope if it is about:
+- General knowledge unrelated to Shiva products/services (politics, weather, sports scores, entertainment, cooking, travel, etc.)
+- External websites, services, or companies not related to Shiva
+- Personal advice not related to their Shiva Softwares account or service usage
+
+Consider the question in-scope if it relates to:
+- Shiva Softwares products, services, platforms, or features
+- Customer's Shiva Softwares account, billing, payments, or subscriptions
+- Technical issues with Shiva Softwares software
+- How to use Shiva Softwares tools or features
+- Shiva Softwares support processes (tickets, escalation, etc.)
+
+You have access to knowledge base context about Shiva Softwares. Use this to determine if the question relates to Shiva Softwares.
+
+Respond in JSON format:
+{
+    "is_out_of_scope": true/false,
+    "reasoning": "brief explanation",
+    "confidence": 0.0-1.0
+}"""
+
+        user_message = f"""Customer question: {message}
+
+Knowledge base context:
+{kb_context if kb_context else "No relevant KB context found"}
+
+Customer data:
+{customer_data if customer_data else "No customer data provided"}
+
+Is this question within the scope of Shiva Softwares support?"""
+
+        try:
+            messages = [
+                ChatMessage(role="system", content=system_prompt),
+                ChatMessage(role="user", content=user_message),
+            ]
+
+            response = await self.chat_completion(
+                messages=messages,
+                temperature=0.3,  # Lower temperature for more consistent classification
+                max_tokens=200,
+                reasoning_effort="low",
+            )
+
+            # Parse JSON response
+            import json
+            result = json.loads(response.content)
+
+            return {
+                "is_out_of_scope": result.get("is_out_of_scope", False),
+                "reasoning": result.get("reasoning", ""),
+                "confidence": result.get("confidence", 0.8),
+            }
+        except Exception as e:
+            logger.error(
+                "Error determining out-of-scope with Groq",
+                error=str(e),
+                message=message,
+            )
+            # Fallback: conservative approach - assume in-scope if analysis fails
+            return {
+                "is_out_of_scope": False,
+                "reasoning": "Analysis failed, defaulting to in-scope",
+                "confidence": 0.5,
+            }
+
+    async def should_escalate(
+        self,
+        message: str,
+        response: str,
+        kb_context: str,
+        conversation_history: List,
+        customer_data: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Ask Groq to determine if the conversation should be escalated to a human agent.
+
+        This replaces fragile phrase-matching with structured LLM decision-making,
+        making escalation detection work across all languages including Kiswahili.
+
+        Returns:
+            Dict with keys:
+            - escalate: bool (whether to escalate to human)
+            - reason: str (specific reason for escalation decision)
+            - confidence: float (0.0-1.0 confidence in the decision)
+        """
+        system_prompt = """You are a support AI escalation decision system. Your task is to determine if a customer conversation should be escalated to a human agent.
+
+Consider escalating if:
+- The AI's solution doesn't address the customer's specific situation
+- The customer indicates previous solutions didn't work
+- The issue involves security, legal matters, or complex investigations
+- The customer is expressing frustration or strong dissatisfaction
+- The issue is highly complex and requires human judgment
+- The customer explicitly requests to speak to a human
+- Multiple AI attempts have failed to resolve the issue
+
+Do NOT escalate if:
+- The AI provided a clear, actionable solution that addresses the customer's question
+- The customer is asking for clarification or additional information
+- The issue is straightforward and within the AI's capabilities
+- The customer is satisfied with the AI's assistance
+
+HONESTY IN DECISIONS:
+- Be conservative about escalation - escalate when genuinely uncertain or when human judgment is needed
+- Don't rely on AI phrases like "I'll create a ticket" - those are language patterns, not actual actions
+- Consider whether the customer truly needs human intervention vs whether AI can continue helping
+- If in doubt, err on the side of escalation to ensure customers get the help they need
+
+Respond in JSON format:
+{
+    "escalate": true/false,
+    "reason": "specific reason for the decision",
+    "confidence": 0.0-1.0
+}"""
+
+        # Build conversation summary from history
+        history_summary = ""
+        if conversation_history:
+            recent_messages = conversation_history[-5:] if len(conversation_history) > 5 else conversation_history
+            history_summary = "\n".join([
+                f"{msg.sender}: {msg.content}" 
+                for msg in recent_messages
+            ])
+
+        user_message = f"""Customer message: {message}
+
+AI response: {response}
+
+Knowledge base context: {kb_context if kb_context else "No relevant KB context found"}
+
+Conversation history:
+{history_summary if history_summary else "No previous conversation"}
+
+Customer data: {customer_data if customer_data else "No customer data provided"}
+
+Should this conversation be escalated to a human agent?"""
+
+        try:
+            messages = [
+                ChatMessage(role="system", content=system_prompt),
+                ChatMessage(role="user", content=user_message),
+            ]
+
+            response = await self.chat_completion(
+                messages=messages,
+                temperature=0.3,  # Lower temperature for consistent decisions
+                max_tokens=200,
+                reasoning_effort="low",
+            )
+
+            # Parse JSON response
+            result = json.loads(response.content)
+
+            return {
+                "escalate": result.get("escalate", False),
+                "reason": result.get("reason", ""),
+                "confidence": result.get("confidence", 0.8),
+            }
+        except Exception as e:
+            logger.error(
+                "Error determining escalation with Groq",
+                error=str(e),
+                message=message,
+            )
+            # Fallback: conservative approach - don't escalate if analysis fails
+            return {
+                "escalate": False,
+                "reason": "Analysis failed, defaulting to no escalation",
+                "confidence": 0.5,
+            }
+
+    async def generate_ticket_title(
+        self,
+        message: str,
+        customer_data: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """
+        Generate a concise, descriptive title for a ticket based on the customer's message.
+
+        Args:
+            message: The customer's message or issue description
+            customer_data: Optional customer information for context
+
+        Returns:
+            A concise title (3-8 words) that summarizes the issue
+        """
+        system_prompt = """You are a support conversation title generator. Your task is to create short, specific titles for support conversations.
+
+Rules:
+- Title must be 3-8 words
+- Be specific to the client's issue, product, or request
+- Do not use generic titles such as "New conversation", "Support request", or "Help needed"
+- Do not include quotation marks, emojis, markdown, or ending punctuation
+- Use sentence case (capitalize first word only)
+- Do not expose sensitive information (passwords, API keys, personal data)
+- Focus on the main problem or action
+
+Examples:
+Client: "My M-Pesa payment callback is failing"
+Title: "M-Pesa callback failure"
+
+Client: "How do I create a new user?"
+Title: "Creating a new user"
+
+Client: "The dashboard is slow after login"
+Title: "Slow dashboard after login"
+
+Client: "I can't access my account"
+Title: "Unable to access account"
+
+Client: "Payment gateway setup issues"
+Title: "Payment gateway setup issues"
+
+Respond with ONLY the title, no additional text or explanation."""
+
+        user_message = f"""Client message: {message}
+
+Customer data: {customer_data if customer_data else "Not provided"}
+
+Generate a conversation title:"""
+
+        try:
+            messages = [
+                ChatMessage(role="system", content=system_prompt),
+                ChatMessage(role="user", content=user_message),
+            ]
+
+            response = await self.chat_completion(
+                messages=messages,
+                temperature=0.3,  # Lower temperature for consistent titles
+                max_tokens=50,
+                reasoning_effort="low",
+            )
+
+            # Clean up the response - extract just the title
+            title = response.content.strip()
+
+            # Remove any quotes if present
+            title = title.strip('"\'').strip()
+
+            # Remove any ending punctuation
+            title = title.rstrip('.,!?;:')
+
+            # Ensure sentence case (capitalize first word only)
+            if title:
+                title = title[0].upper() + title[1:].lower()
+
+            # Ensure it's not too long
+            if len(title) > 100:
+                title = title[:97] + "..."
+
+            # Check word count and adjust if needed
+            words = title.split()
+            if len(words) < 3:
+                # If too short, add context words
+                if "issue" not in title.lower():
+                    title = f"{title} issue"
+                words = title.split()
+            elif len(words) > 8:
+                # If too long, truncate to 8 words
+                title = ' '.join(words[:8])
+
+            # Fallback if title is empty or too generic
+            generic_titles = ["new conversation", "support request", "help needed", "customer support", "support ticket"]
+            if not title or any(generic in title.lower() for generic in generic_titles):
+                title = "Support conversation"
+
+            logger.info(
+                "Generated conversation title",
+                title=title,
+                word_count=len(title.split()),
+                original_message_length=len(message),
+            )
+
+            return title
+
+        except Exception as e:
+            logger.error(
+                "Failed to generate conversation title",
+                error=str(e),
+                message=message,
+            )
+            # Fallback to a generic title
+            return "Support conversation"

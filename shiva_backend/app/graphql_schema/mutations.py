@@ -1,9 +1,10 @@
 import strawberry
-from typing import Optional, TYPE_CHECKING
+from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+import structlog
 
-if TYPE_CHECKING:
-    from app.support_ai.service import SupportAIService
+logger = structlog.get_logger(__name__)
 
 from app.graphql_schema.types import (
     Ticket,
@@ -31,19 +32,15 @@ from app.graphql_schema.types import (
 from app.graphql_schema.queries import ticket_to_graphql, message_to_graphql, fix_to_graphql, chat_session_to_graphql, chat_message_to_graphql
 from app.ticket_center.service import TicketCenterService, UserRole
 from app.chat_center.service import ChatCenterService
-from app.db.models import TicketMessage as DBMessage, MessageSender as DBMessageSender, AIResolutionFeedback as DBAIResolutionFeedback
+from app.db.models import TicketMessage as DBMessage, MessageSender as DBMessageSender, AIResolutionFeedback as DBAIResolutionFeedback, Customer, ChatSessionStatus
 from app.ai_router.classifier import AIRouter
 from app.support_ai.service import SupportAIService
 from app.code_ai.service import CodeAIService
 from app.staff_ai.service import StaffAIService
-from app.clients.customer_api import CustomerApiClient
 from app.clients.qdrant_client import QdrantClient
 from app.clients.groq_client import GroqClient
 from app.clients.codex_client import CodexClient
-from app.code_ai.readers import MockLogReader, MockCodeReader
-import structlog
-
-logger = structlog.get_logger(__name__)
+from app.code_ai.readers import FileLogReader, GitCodeReader
 
 
 @strawberry.type
@@ -70,8 +67,35 @@ class Mutation:
         session: AsyncSession = context.get("session")
         chat_service = ChatCenterService(session)
 
-        # Get or create active chat session
-        chat_session = await chat_service.get_or_create_chat_session(customer_id)
+        # Handle chat session based on whether chat_session_id is provided
+        if input.chat_session_id:
+            # Fetch the specific session by ID
+            chat_session = await chat_service.get_chat_session(input.chat_session_id)
+            if not chat_session:
+                raise ValueError(f"Chat session {input.chat_session_id} not found")
+
+            # Validate it belongs to the authenticated customer
+            if chat_session.customer_id != customer_id:
+                raise ValueError("You can only access your own chat sessions")
+
+            # Handle based on session status
+            if chat_session.status == ChatSessionStatus.ESCALATED:
+                raise ValueError(
+                    "This chat session has been escalated to a ticket. "
+                    "Please use the ticket reply flow to continue the conversation."
+                )
+            elif chat_session.status == ChatSessionStatus.RESOLVED:
+                # Reopen the resolved session
+                chat_session = await chat_service.reopen_chat_session(input.chat_session_id)
+                logger.info(
+                    "Reopened resolved chat session",
+                    customer_id=customer_id,
+                    chat_session_id=chat_session.id,
+                )
+            # If ACTIVE, use as-is
+        else:
+            # Fall back to current behavior: get or create active session
+            chat_session = await chat_service.get_or_create_chat_session(customer_id)
 
         # Process the message through AI
         result = await chat_service.process_chat_message(
@@ -145,11 +169,25 @@ class Mutation:
             updated_ticket = await ticket_service.get_ticket(existing_ticket.id)
             return ticket_to_graphql(updated_ticket)
         else:
+            # Generate AI title for the ticket
+            try:
+                from app.clients.groq_client import GroqClient
+                groq_client = GroqClient()
+                customer_data = {"customer_id": customer_id}  # Basic customer data
+                ticket_title = await groq_client.generate_ticket_title(
+                    message=input.content,
+                    customer_data=customer_data,
+                )
+            except Exception as e:
+                logger.error("Failed to generate ticket title", error=str(e))
+                ticket_title = None
+
             # Create new ticket
             new_ticket = await ticket_service.create_ticket(
                 customer_id=customer_id,
                 initial_message=input.content,
                 attachments=input.attachment_ids,
+                title=ticket_title,
             )
             
             # Trigger AI routing for the new ticket
@@ -208,10 +246,20 @@ class Mutation:
         )
 
         # Initialize Support AI with smart escalation
+        from app.clients.gemini_client import GeminiClient
+        from app.config import settings
+        
+        complex_task_client = None
+        if settings.gemini_api_key:
+            try:
+                complex_task_client = GeminiClient()
+            except Exception as e:
+                logger.warning("Failed to initialize Gemini client, using Groq only", error=str(e))
+        
         support_ai = SupportAIService(
             qdrant_client=QdrantClient(),
             groq_client=GroqClient(),
-            customer_api_client=CustomerApiClient(),
+            complex_task_client=complex_task_client,
         )
 
         # Process with smart escalation (is_agent_request=True)
@@ -295,10 +343,21 @@ class Mutation:
 
             # Generate chat summary for staff
             conversation_history = await ticket_service.get_ticket_messages(input.ticket_id)
+            
+            from app.clients.gemini_client import GeminiClient
+            from app.config import settings
+            
+            complex_task_client = None
+            if settings.gemini_api_key:
+                try:
+                    complex_task_client = GeminiClient()
+                except Exception as e:
+                    logger.warning("Failed to initialize Gemini client, using Groq only", error=str(e))
+            
             support_ai = SupportAIService(
                 qdrant_client=QdrantClient(),
                 groq_client=GroqClient(),
-                customer_api_client=CustomerApiClient(),
+                complex_task_client=complex_task_client,
             )
             chat_summary = await support_ai.generate_chat_summary(
                 ticket_id=input.ticket_id,
@@ -328,6 +387,24 @@ class Mutation:
         updated_ticket = await ticket_service.get_ticket(input.ticket_id)
         return ticket_to_graphql(updated_ticket)
 
+    def _create_support_ai(self):
+        """Helper to create SupportAIService with optional Gemini client."""
+        from app.clients.gemini_client import GeminiClient
+        from app.config import settings
+        
+        complex_task_client = None
+        if settings.gemini_api_key:
+            try:
+                complex_task_client = GeminiClient()
+            except Exception as e:
+                logger.warning("Failed to initialize Gemini client, using Groq only", error=str(e))
+        
+        return SupportAIService(
+            qdrant_client=QdrantClient(),
+            groq_client=GroqClient(),
+            complex_task_client=complex_task_client,
+        )
+
     async def _route_ticket(
         self,
         ticket_id: str,
@@ -338,11 +415,7 @@ class Mutation:
     ):
         """Route ticket through AI Router to appropriate AI service."""
         # Initialize Support AI for chat summary generation
-        support_ai = SupportAIService(
-            qdrant_client=QdrantClient(),
-            groq_client=GroqClient(),
-            customer_api_client=CustomerApiClient(),
-        )
+        support_ai = self._create_support_ai()
 
         try:
             # Initialize AI Router
@@ -408,11 +481,7 @@ class Mutation:
         """Handle routing to Support AI."""
         # Initialize Support AI if not provided
         if support_ai is None:
-            support_ai = SupportAIService(
-                qdrant_client=QdrantClient(),
-                groq_client=GroqClient(),
-                customer_api_client=CustomerApiClient(),
-            )
+            support_ai = self._create_support_ai()
 
         try:
             ticket = await ticket_service.get_ticket(ticket_id)
@@ -456,18 +525,14 @@ class Mutation:
         """Handle routing to Code/Server AI."""
         # Initialize Support AI for chat summary generation if not provided
         if support_ai is None:
-            support_ai = SupportAIService(
-                qdrant_client=QdrantClient(),
-                groq_client=GroqClient(),
-                customer_api_client=CustomerApiClient(),
-            )
+            support_ai = self._create_support_ai()
 
         try:
             # Initialize Code AI
             code_ai = CodeAIService(
                 codex_client=CodexClient(),
-                log_reader=MockLogReader(),  # Would use real implementation
-                code_reader=MockCodeReader(),  # Would use real implementation
+                log_reader=FileLogReader(),  # Real implementation
+                code_reader=GitCodeReader(),  # Real implementation
             )
 
             # Process technical issue
@@ -592,10 +657,17 @@ class Mutation:
         from app.notifications.email import EmailNotificationService
 
         try:
-            customer = await CustomerApiClient().get_account(ticket.customer_id)
-            await EmailNotificationService().send_staff_reply(
-                customer.email, ticket.id, input.content
+            # Get customer from database instead of external API
+            from app.db.models import Customer
+            customer_result = await session.execute(
+                select(Customer).where(Customer.id == ticket.customer_id)
             )
+            customer = customer_result.scalar_one_or_none()
+            
+            if customer:
+                await EmailNotificationService().send_staff_reply(
+                    customer.email, ticket.id, input.content
+                )
         except Exception as exc:
             logger.error(
                 "Unable to send customer reply notification",

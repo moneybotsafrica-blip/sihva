@@ -310,13 +310,43 @@ class TestTicketStatusTransitions:
     async def test_close_ticket_by_customer_forbidden(
         self, ticket_service: TicketCenterService, sample_ticket: Ticket
     ):
-        """Test that customers cannot close tickets."""
-        with pytest.raises(ValueError, match="not authorized to close tickets"):
+        """Test that customers cannot close tickets that are not RESOLVED_AUTO."""
+        # Customers should not be able to close OPEN tickets
+        with pytest.raises(ValueError, match="Customers can only close tickets that are RESOLVED_AUTO"):
             await ticket_service.close_ticket(
                 ticket_id=sample_ticket.id,
                 closed_by="cust_123",
                 role=UserRole.CUSTOMER,
             )
+        
+        # Customers should not be able to close PENDING_STAFF tickets
+        await ticket_service.queue_for_staff(
+            ticket_id=sample_ticket.id,
+            reason="Test escalation",
+        )
+        with pytest.raises(ValueError, match="Customers can only close tickets that are RESOLVED_AUTO"):
+            await ticket_service.close_ticket(
+                ticket_id=sample_ticket.id,
+                closed_by="cust_123",
+                role=UserRole.CUSTOMER,
+            )
+    
+    @pytest.mark.asyncio
+    async def test_close_ticket_by_customer_allowed_resolved_auto(
+        self, ticket_service: TicketCenterService, sample_ticket: Ticket
+    ):
+        """Test that customers can close their own RESOLVED_AUTO tickets."""
+        # First resolve the ticket
+        await ticket_service.resolve_auto(ticket_id=sample_ticket.id)
+        
+        # Then customer should be able to close it
+        ticket = await ticket_service.close_ticket(
+            ticket_id=sample_ticket.id,
+            closed_by="cust_123",
+            role=UserRole.CUSTOMER,
+        )
+        
+        assert ticket.status == TicketStatus.CLOSED
 
     @pytest.mark.asyncio
     async def test_reopen_resolved_ticket(
@@ -442,10 +472,10 @@ class TestFixRecommendations:
         assert fix_rec.notes == "Not correct"
 
     @pytest.mark.asyncio
-    async def test_request_more_info_fix(
+    async def test_reject_fix(
         self, ticket_service: TicketCenterService, sample_ticket: Ticket
     ):
-        """Test requesting more info for a fix recommendation."""
+        """Test rejecting a fix recommendation."""
         await ticket_service.create_fix_recommendation(
             ticket_id=sample_ticket.id,
             diff="fix",
@@ -454,12 +484,12 @@ class TestFixRecommendations:
 
         fix_rec = await ticket_service.review_fix(
             ticket_id=sample_ticket.id,
-            decision=FixRecommendationStatus.NEEDS_INFO,
+            decision=FixRecommendationStatus.REJECTED,
             staff_id="staff_123",
             notes="Need more context",
         )
 
-        assert fix_rec.status == FixRecommendationStatus.NEEDS_INFO
+        assert fix_rec.status == FixRecommendationStatus.REJECTED
         assert fix_rec.notes == "Need more context"
 
     @pytest.mark.asyncio

@@ -5,6 +5,8 @@ from app.clients.qdrant_client import QdrantClientInterface, SearchResult
 from app.clients.groq_client import GroqClientInterface, ChatMessage, LLMResponse
 from app.ticket_center.service import TicketCenterService
 from app.config import settings
+from app.common.prompts import LANGUAGE_POLICY, HONESTY_CALIBRATION, VERIFICATION_PROMPT
+from app.common.language_check import enforce_language_policy
 
 logger = structlog.get_logger(__name__)
 
@@ -258,6 +260,9 @@ class StaffAIService:
             max_tokens=800,
         )
 
+        # Enforce language policy on staff-facing responses
+        response.content = enforce_language_policy(response.content, staff_query)
+
         logger.debug(
             "Generated staff assistance response",
             confidence=response.confidence,
@@ -284,6 +289,12 @@ class StaffAIService:
             "- Suggest responses that resolve the customer's issue efficiently",
             "- If the issue is complex, break it down into clear steps",
             "- Always maintain a professional and helpful tone",
+            "",
+            HONESTY_CALIBRATION,
+            "",
+            VERIFICATION_PROMPT,
+            "",
+            LANGUAGE_POLICY,
             "",
         ]
 
@@ -324,7 +335,7 @@ class StaffAIService:
         return "\n".join(prompt_parts)
 
     def _build_analysis_prompt(self, customer_messages: List) -> str:
-        """Build prompt for ticket context analysis."""
+        """Build prompt for ticket context analysis (internal classifier - not shown to staff)."""
 
         conversation_text = "\n".join([f"- {msg.content}" for msg in customer_messages])
 
@@ -342,7 +353,7 @@ COMPLEXITY_SCORE: [0.0 to 1.0, where 1.0 is most complex]"""
         return prompt
 
     def _build_escalation_prompt(self, current_issue: str, conversation_history: List) -> str:
-        """Build prompt for escalation analysis."""
+        """Build prompt for escalation analysis (internal classifier - not shown to staff)."""
 
         history_text = "\n".join([f"- {msg.content[:100]}" for msg in conversation_history[-3:]])
 

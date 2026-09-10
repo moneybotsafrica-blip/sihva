@@ -38,6 +38,14 @@ class FixRecommendationStatus(Enum):
 
 
 @strawberry.enum
+class AISuggestedResolutionStatus(Enum):
+    PENDING = "PENDING"
+    REVIEWED = "REVIEWED"
+    USED = "USED"
+    DISMISSED = "DISMISSED"
+
+
+@strawberry.enum
 class UserRole(Enum):
     CUSTOMER = "customer"
     STAFF = "staff"
@@ -105,6 +113,24 @@ class FixRecommendation:
 
 
 @strawberry.type
+class AISuggestedResolution:
+    """Staff-only AI suggested resolution for escalated tickets."""
+    id: str
+    ticket_id: str
+    suggested_solution: str
+    confidence: float
+    escalation_reason: str
+    kb_article_ids: Optional[List[str]]
+    kb_similarity_score: Optional[float]
+    agent_type: Optional[str]
+    status: AISuggestedResolutionStatus
+    reviewed_by: Optional[str]
+    reviewed_at: Optional[datetime]
+    notes: Optional[str]
+    created_at: datetime
+
+
+@strawberry.type
 class Ticket:
     id: str
     customer_id: str
@@ -113,8 +139,10 @@ class Ticket:
     created_at: datetime
     updated_at: datetime
     assigned_staff_id: Optional[str]
+    title: Optional[str]
     messages: List[TicketMessage]
     fix_recommendation: Optional[FixRecommendation]
+    ai_suggested_resolution: Optional[AISuggestedResolution]
     ai_resolution_feedback: Optional[AIResolutionFeedback]
     ai_resolution_feedback_at: Optional[datetime]
     ai_resolution_feedback_comment: Optional[str]
@@ -170,6 +198,7 @@ class AIResolutionFeedbackInput:
 class SendChatMessageInput:
     content: str
     attachment_ids: Optional[List[str]] = None
+    chat_session_id: Optional[str] = None
 
 
 @strawberry.type

@@ -1,7 +1,7 @@
 """Add API keys table
 
-Revision ID: 20260908_add_api_keys
-Revises: 20260908_add_staff_notes
+Revision ID: 005
+Revises: 004
 Create Date: 2026-09-08 11:10:00.000000
 
 """
@@ -12,8 +12,8 @@ import sqlalchemy as sa
 from sqlalchemy.dialects import sqlite
 
 # revision identifiers, used by Alembic.
-revision: str = '20260908_add_api_keys'
-down_revision: Union[str, None] = '20260908_add_staff_notes'
+revision: str = '005'
+down_revision: Union[str, None] = '004'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

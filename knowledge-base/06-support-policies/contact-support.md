@@ -1,6 +1,6 @@
 ---
 id: KB-SUPPORT-001
-title: Contact the Sidai support team
+title: Contact the Shiva Softwares support team
 category: support-policies
 tags: [contact, support, help, order shipping, product question]
 audience: [customer, support-agent]
@@ -9,7 +9,7 @@ source: [frontend/src/components/contact/ContactPage.jsx, backend/app/Http/Contr
 confidence: high
 ---
 
-# Contact the Sidai support team
+# Contact the Shiva Softwares support team
 
 ## Steps
 
@@ -17,7 +17,7 @@ Use the contact page and provide first name, last name, email, topic, and a mess
 
 ## Expected result
 
-When Telegram support delivery succeeds, the site confirms that the message was sent to the Telegram support team. It may also send a support email when that feature is enabled.
+When Telegram support delivery succeeds, the site confirms that the message was sent to the Shiva Softwares support team. It may also send a support email when that feature is enabled.
 
 ## Common problem
 

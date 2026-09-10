@@ -57,8 +57,24 @@ def run_migrations_online() -> None:
     and associate a connection with the context.
 
     """
+    # For SQLite with aiosqlite, we need to use synchronous sqlite driver for migrations
+    database_url = settings.database_url
+    
+    # Convert aiosqlite URL to synchronous sqlite for migrations
+    if "aiosqlite" in database_url:
+        # Handle both absolute and relative paths properly
+        if database_url.startswith("sqlite+aiosqlite:///"):
+            # Relative path: sqlite+aiosqlite:///./shiva_support.db
+            database_url = database_url.replace("sqlite+aiosqlite:///", "sqlite:///")
+        elif database_url.startswith("sqlite+aiosqlite://"):
+            # Absolute path or other format
+            database_url = database_url.replace("sqlite+aiosqlite://", "sqlite://")
+    
+    configuration = config.get_section(config.config_ini_section, {})
+    configuration["sqlalchemy.url"] = database_url
+    
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
+        configuration,
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )

@@ -3,12 +3,14 @@ from typing import Optional, List, Any
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from sqlalchemy import select
+from strawberry.types import Info
 
 from app.graphql_schema.types import (
     Ticket,
     TicketStatus,
     TicketMessage,
     FixRecommendation,
+    AISuggestedResolution,
     AIResolutionFeedback as GraphQLAIResolutionFeedback,
     ChatSession,
     ChatMessage,
@@ -21,11 +23,13 @@ from app.db.models import (
     Ticket as DBTicket,
     TicketMessage as DBMessage,
     FixRecommendation as DBFix,
+    AISuggestedResolution as DBAISuggestedResolution,
     AIResolutionFeedback as DBAIResolutionFeedback,
     ChatSession as DBChatSession,
     ChatMessage as DBChatMessage,
     ChatSessionStatus as DBChatSessionStatus,
     TicketStatus as DBTicketStatus,
+    Staff as DBStaff,
 )
 
 
@@ -65,7 +69,7 @@ def chat_message_to_graphql(db_chat_message: DBChatMessage) -> ChatMessage:
     )
 
 
-def ticket_to_graphql(db_ticket: DBTicket) -> Ticket:
+def ticket_to_graphql(db_ticket: DBTicket, user_role: Optional[str] = None) -> Ticket:
     """Convert database Ticket model to GraphQL type."""
     # Map database enum to GraphQL enum for AI resolution feedback
     feedback_mapping = {
@@ -77,6 +81,11 @@ def ticket_to_graphql(db_ticket: DBTicket) -> Ticket:
 
     graphql_feedback = feedback_mapping.get(db_ticket.ai_resolution_feedback) if db_ticket.ai_resolution_feedback else None
 
+    # Only include AI suggested resolution for staff/developer roles
+    ai_resolution = None
+    if user_role in ["staff", "developer"]:
+        ai_resolution = ai_resolution_to_graphql(db_ticket.ai_suggested_resolution) if db_ticket.ai_suggested_resolution else None
+
     return Ticket(
         id=db_ticket.id,
         customer_id=db_ticket.customer_id,
@@ -85,8 +94,10 @@ def ticket_to_graphql(db_ticket: DBTicket) -> Ticket:
         created_at=db_ticket.created_at,
         updated_at=db_ticket.updated_at,
         assigned_staff_id=db_ticket.assigned_staff_id,
+        title=db_ticket.title,
         messages=[message_to_graphql(msg) for msg in db_ticket.messages],
         fix_recommendation=fix_to_graphql(db_ticket.fix_recommendation) if db_ticket.fix_recommendation else None,
+        ai_suggested_resolution=ai_resolution,
         ai_resolution_feedback=graphql_feedback,
         ai_resolution_feedback_at=db_ticket.ai_resolution_feedback_at,
         ai_resolution_feedback_comment=db_ticket.ai_resolution_feedback_comment,
@@ -124,10 +135,30 @@ def fix_to_graphql(db_fix: DBFix) -> FixRecommendation:
     )
 
 
+def ai_resolution_to_graphql(db_ai_resolution: DBAISuggestedResolution) -> AISuggestedResolution:
+    """Convert database AISuggestedResolution model to GraphQL type."""
+    from app.graphql_schema.types import AISuggestedResolution as GraphQLAISuggestedResolution
+    return GraphQLAISuggestedResolution(
+        id=db_ai_resolution.id,
+        ticket_id=db_ai_resolution.ticket_id,
+        suggested_solution=db_ai_resolution.suggested_solution,
+        confidence=db_ai_resolution.confidence,
+        escalation_reason=db_ai_resolution.escalation_reason,
+        kb_article_ids=db_ai_resolution.kb_article_ids,
+        kb_similarity_score=db_ai_resolution.kb_similarity_score,
+        agent_type=db_ai_resolution.agent_type,
+        status=db_ai_resolution.status,
+        reviewed_by=db_ai_resolution.reviewed_by,
+        reviewed_at=db_ai_resolution.reviewed_at,
+        notes=db_ai_resolution.notes,
+        created_at=db_ai_resolution.created_at,
+    )
+
+
 @strawberry.type
 class Query:
     @strawberry.field
-    async def my_chat_session(self, info) -> Optional[ChatSession]:
+    async def my_chat_session(self, info: Info) -> Optional[ChatSession]:
         """
         Customer query: Get the customer's current active chat session.
         Requires authentication context.
@@ -151,7 +182,7 @@ class Query:
         return None
 
     @strawberry.field
-    async def my_chat_history(self, info, limit: int = 20) -> List[ChatSession]:
+    async def my_chat_history(self, info: Info, limit: int = 20) -> List[ChatSession]:
         """Return the customer's stored chat sessions and their messages."""
         context = info.context
         current_user = context.get("current_user")
@@ -170,7 +201,7 @@ class Query:
         return [chat_session_to_graphql(session) for session in result.scalars().all()]
 
     @strawberry.field
-    async def my_ticket(self, info) -> Optional[Ticket]:
+    async def my_ticket(self, info: Info) -> Optional[Ticket]:
         """
         Customer query: Get the customer's current open ticket.
         Requires authentication context.
@@ -190,13 +221,13 @@ class Query:
         db_ticket = await ticket_service.get_customer_ticket(customer_id)
 
         if db_ticket:
-            return ticket_to_graphql(db_ticket)
+            return ticket_to_graphql(db_ticket, user_role="customer")
         return None
 
     @strawberry.field
     async def my_support_history(
         self,
-        info,
+        info: Info,
         limit: int = 50,
         offset: int = 0,
     ) -> List[Ticket]:
@@ -222,12 +253,12 @@ class Query:
             offset=offset,
         )
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role="customer") for ticket in db_tickets]
 
     @strawberry.field
     async def tickets(
         self,
-        info,
+        info: Info,
         status: Optional[TicketStatus] = None,
         assigned_to: Optional[str] = None,
         limit: int = 100,
@@ -258,10 +289,10 @@ class Query:
             offset=offset,
         )
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role="customer") for ticket in db_tickets]
 
     @strawberry.field
-    async def ticket(self, info, id: str) -> Optional[Ticket]:
+    async def ticket(self, info: Info, id: str) -> Optional[Ticket]:
         """
         Staff query: Get a specific ticket by ID.
         Requires staff or developer role.
@@ -281,18 +312,19 @@ class Query:
         result = await session.execute(
             select(DBTicket)
             .options(selectinload(DBTicket.fix_recommendation))
+            .options(selectinload(DBTicket.ai_suggested_resolution))
             .where(DBTicket.id == id)
         )
         db_ticket = result.scalar_one_or_none()
 
         if db_ticket:
-            return ticket_to_graphql(db_ticket)
+            return ticket_to_graphql(db_ticket, user_role=current_user.role)
         return None
 
     @strawberry.field
     async def ai_resolved_tickets(
         self,
-        info,
+        info: Info,
         feedback: Optional[GraphQLAIResolutionFeedback] = None,
         limit: int = 100,
         offset: int = 0,
@@ -329,12 +361,12 @@ class Query:
             offset=offset,
         )
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role="staff") for ticket in db_tickets]
 
     @strawberry.field
     async def staff_dashboard_tickets(
         self,
-        info,
+        info: Info,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Ticket]:
@@ -357,17 +389,18 @@ class Query:
         from app.db.models import DBTicket
 
         query = select(DBTicket).options(selectinload(DBTicket.fix_recommendation))
+        query = query.options(selectinload(DBTicket.ai_suggested_resolution))
         query = query.order_by(DBTicket.created_at.desc()).limit(limit).offset(offset)
 
         result = await session.execute(query)
         db_tickets = list(result.scalars().all())
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role=current_user.role) for ticket in db_tickets]
 
     @strawberry.field
     async def unassigned_tickets(
         self,
-        info,
+        info: Info,
         limit: int = 100,
         offset: int = 0,
     ) -> List[Ticket]:
@@ -391,6 +424,7 @@ class Query:
         from sqlalchemy import or_
 
         query = select(DBTicket).options(selectinload(DBTicket.fix_recommendation))
+        query = query.options(selectinload(DBTicket.ai_suggested_resolution))
         query = query.where(
             or_(
                 DBTicket.assigned_staff_id.is_(None),
@@ -402,12 +436,12 @@ class Query:
         result = await session.execute(query)
         db_tickets = list(result.scalars().all())
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role=current_user.role) for ticket in db_tickets]
 
     @strawberry.field
     async def staff_members(
         self,
-        info,
+        info: Info,
     ) -> List["StaffInfo"]:
         """
         Staff query: Get all staff members information.
@@ -422,27 +456,27 @@ class Query:
         if current_user.role not in ["staff", "developer"]:
             raise ValueError("This query requires staff or developer role")
 
-        # Get staff information from mock database
-        from app.db.mock_db import get_mock_staff_ids, get_mock_staff_info
+        session: AsyncSession = context.get("session")
 
-        staff_ids = get_mock_staff_ids()
-        staff_members = []
+        # Get all active staff members from database
+        result = await session.execute(
+            select(DBStaff).where(DBStaff.is_active == True)
+        )
+        staff_members_db = list(result.scalars().all())
 
-        for staff_id in staff_ids:
-            staff_info = get_mock_staff_info(staff_id)
-            if staff_info:
-                staff_members.append(StaffInfo(
-                    staff_id=staff_id,
-                    name=staff_info.get("name", staff_id),
-                    role=staff_info.get("role", "staff")
-                ))
-
-        return staff_members
+        return [
+            StaffInfo(
+                staff_id=staff.id,
+                name=staff.name,
+                role=staff.role
+            )
+            for staff in staff_members_db
+        ]
 
     @strawberry.field
     async def ticket_queue(
         self,
-        info,
+        info: Info,
         status: Optional[TicketStatus] = None,
         assigned_to: Optional[str] = None,
         limit: int = 100,
@@ -470,6 +504,7 @@ class Query:
         from sqlalchemy import or_, and_
 
         query = select(DBTicket).options(selectinload(DBTicket.fix_recommendation))
+        query = query.options(selectinload(DBTicket.ai_suggested_resolution))
 
         # Build conditions for staff-relevant tickets
         # Include all tickets that are either:
@@ -496,12 +531,12 @@ class Query:
         result = await session.execute(query)
         db_tickets = list(result.scalars().all())
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role=current_user.role) for ticket in db_tickets]
 
     @strawberry.field
     async def customer_support_history(
         self,
-        info,
+        info: Info,
         customer_id: str,
         limit: int = 50,
         offset: int = 0,
@@ -527,4 +562,4 @@ class Query:
             offset=offset,
         )
 
-        return [ticket_to_graphql(ticket) for ticket in db_tickets]
+        return [ticket_to_graphql(ticket, user_role=current_user.role) for ticket in db_tickets]

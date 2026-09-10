@@ -95,22 +95,3 @@ class CustomerApiClient(CustomerApiClientInterface):
     async def close(self):
         """Close the HTTP client."""
         await self.client.aclose()
-
-
-class MockCustomerApiClient(CustomerApiClientInterface):
-    """Mock implementation for testing."""
-
-    def __init__(self):
-        self.customers: Dict[str, CustomerAccount] = {}
-
-    def add_mock_customer(self, account: CustomerAccount):
-        """Add a mock customer for testing."""
-        self.customers[account.customer_id] = account
-
-    async def get_account(self, customer_id: str) -> Optional[CustomerAccount]:
-        """Return mock customer account."""
-        return self.customers.get(customer_id)
-
-    async def validate_customer(self, customer_id: str) -> bool:
-        """Validate mock customer."""
-        return customer_id in self.customers

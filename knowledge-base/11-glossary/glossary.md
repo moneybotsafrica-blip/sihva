@@ -1,6 +1,6 @@
 ---
 id: KB-GLOSSARY-001
-title: Sidai Artistry glossary
+title: Shiva Softwares glossary
 category: glossary
 tags: [glossary, order, variant, coupon, payment, review]
 audience: [customer, support-agent, administrator]
@@ -9,7 +9,7 @@ source: [backend/app/Models/Order.php, backend/app/Models/ProductVariant.php, ba
 confidence: high
 ---
 
-# Sidai Artistry glossary
+# Shiva Softwares glossary
 
 ## Active product
 

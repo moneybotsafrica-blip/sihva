@@ -386,7 +386,95 @@ The AI Router follows this exact decision order:
 2. **Knowledge Base Check**: Run Qdrant vector search against the knowledge base
    - If confident match (similarity ≥ threshold) → Route to **Support AI**
 
-3. **Fallback**: If neither step 1 nor step 2 fires → Route to **Staff Queue**
+3. **Escalation Decision**: Support AI uses structured LLM decisions to determine if escalation is needed
+   - **Explicit agent request**: Always escalates immediately (bypasses all gating)
+   - **Structured escalation decision**: Groq LLM returns `{escalate: bool, reason: str, confidence: float}`
+   - **AI attempts cap**: After 5 AI attempts, forces escalation regardless of confidence
+   - **Critical issues**: Security, legal, unauthorized charges always escalate
+   - **Failed solutions**: Customer reports previous AI fix didn't work → escalate
+   - **Novel issues**: Calm but undocumented complex issues still escalate
+
+4. **Fallback**: If neither step 1 nor step 2 fires → Route to **Staff Queue**
+
+### Escalation Reliability
+
+The escalation system is designed to ensure customers never get dropped:
+
+- **Structured decisions**: Escalation uses structured LLM output, not phrase-matching in natural language
+- **Explicit human requests**: `is_agent_request=True` bypasses all gating and escalates directly
+- **AI attempts cap**: Maximum 5 AI-only turns per ticket before forced escalation
+- **Reason propagation**: Actual escalation reasons are carried through to staff queueing and chat summaries
+- **No silent drops**: All escalation paths log the specific rule/reason that fired
+- **Golden regression set**: Five critical scenarios tested continuously:
+  1. Explicit human-agent request on first turn
+  2. Kiswahili escalation
+  3. Security/legal keyword issue
+  4. Customer says previous AI fix did not work
+  5. Calm, novel, undocumented issue with no frustration language
+
+## Customer/Staff Content Separation
+
+The system implements strict separation between customer-facing and staff-facing content to ensure appropriate information exposure:
+
+### Escalation Path: Status Message vs. AI Solution
+
+When a ticket is escalated to staff, customers and staff see different content:
+
+- **Customer view**: Receives a simple status message indicating the ticket has been escalated to a specialist
+  - Example: "I've escalated your issue to our support specialists who can help investigate this further."
+  - No technical details, no AI's attempted solutions
+
+- **Staff view**: Sees the full AI suggested resolution with technical details
+  - AI's complete diagnosis and solution attempt
+  - Confidence score and escalation reason
+  - Metadata on KB matches and agent type used
+  - Enables staff to understand what AI tried before taking over
+
+### AI Suggested Resolution
+
+The `AISuggestedResolution` model stores AI-generated solutions as staff-only artifacts:
+
+- **Fields**:
+  - `suggested_solution`: The full AI-generated technical solution
+  - `confidence`: AI's confidence score in the solution
+  - `escalation_reason`: Specific reason for escalation
+  - `status`: PENDING, REVIEWED, USED, DISMISSED, NEEDS_INFO
+  - `reviewed_by`, `reviewed_at`, `notes`: Staff review metadata
+
+- **Creation timing**: Created automatically when:
+  - Structured escalation decision returns `escalate=True`
+  - AI attempts cap is reached
+  - Conservative fallback rules trigger escalation
+
+- **Storage**: Stored in database as a separate entity linked to the ticket
+- **Access**: Only exposed via GraphQL to staff and developer roles
+
+### Auto-Resolve Path: Unaffected
+
+When tickets are auto-resolved (AI can confidently solve the issue):
+- **Customer view**: Receives the full AI response with actual solution
+- **Staff view**: No AI suggested resolution is created (only for escalation)
+- **Behavior**: Same as before - customers get real answers to solvable issues
+
+### Role-Based Access Control
+
+GraphQL schema enforces role-based field exposure:
+
+- **Customer role**: Cannot see `ai_suggested_resolution`, `chat_summary`, `staff_notes`, or AI metadata fields
+- **Staff role**: Can see all internal fields including AI suggested resolution
+- **Developer role**: Same access as staff role
+
+Field filtering is implemented in `ticket_to_graphql()` converter based on `user_role` parameter.
+
+### Testing Coverage
+
+Comprehensive tests ensure separation works correctly:
+
+- `test_escalation_customer_sees_status_message`: Customer gets status, not technical solution
+- `test_auto_resolve_customer_gets_real_answer`: Auto-resolve path unaffected
+- `test_customer_cannot_see_ai_suggested_resolution`: GraphQL role filtering for customers
+- `test_staff_can_see_ai_suggested_resolution`: Staff can access AI solutions
+- `test_developer_can_see_ai_suggested_resolution`: Developer access to AI solutions
 
 ## Ticket State Machine
 
@@ -400,9 +488,11 @@ Ticket statuses and valid transitions:
 - `CLOSED` → `OPEN` (reopen)
 
 **Important Rules**:
-- Only staff or developers can close tickets
-- One open ticket per customer (enforced at DB level)
-- All status changes go through Ticket Center service methods
+- **Customer self-close policy**: Customers can only close tickets that are `RESOLVED_AUTO` (confirming an AI fix worked). They cannot close `OPEN`, `PENDING_STAFF`, or `IN_PROGRESS` tickets.
+- **Staff/developer close**: Staff and developers can close any ticket
+- **One open ticket per customer**: Enforced at DB level
+- **All status changes**: Go through Ticket Center service methods
+- **AI attempts cap**: Maximum 5 AI-only turns per ticket before forced escalation to staff
 
 ## Deployment
 
@@ -486,6 +576,35 @@ docker run -p 8000:8000 --env-file .env shiva-backend
 4. Add GraphQL types and resolvers
 5. Write comprehensive tests
 6. Update documentation
+
+## AI Behavior Guidelines
+
+### Honesty and Calibration
+
+All AI agents (Support AI, Staff AI) follow strict honesty and calibration rules:
+
+- **No false claims**: Never claim to have completed an action unless confirmed by actual tool/system call
+- **No overpromising**: Never promise specific staff members, response times, or guaranteed outcomes
+- **Clear distinctions**: Distinguish between what AI CAN do (provide information, give instructions) vs what it CANNOT do (modify accounts, process refunds)
+- **Probabilistic language**: Use "should help" or "try this" instead of "will fix it" when uncertain
+- **Admit uncertainty**: If unsure, admit it and suggest escalation rather than guessing
+
+### Verification and Clarification
+
+- **Ask before assuming**: For ambiguous issues, ask ONE targeted clarification question before providing solutions
+- **Verify resolution**: After providing a solution, always ask the customer to confirm it worked
+- **Targeted questions**: Ask for specific details when needed (error messages, current step, account-specific info)
+- **No guessing**: Don't provide solutions based on assumptions about the customer's situation
+
+### Staff Handoff Quality
+
+When escalating to staff, the system provides comprehensive context:
+
+- **What was tried**: AI attempts and solutions attempted
+- **What failed**: Customer feedback on why solutions didn't work
+- **Escalation reason**: Specific reason for escalation (not generic)
+- **Customer urgency/sentiment**: Detected frustration or calm tone
+- **Full context**: Enough information for staff to avoid rereading the entire thread
 
 ## License
 

@@ -214,37 +214,3 @@ class CodexClient(CodexClientInterface):
     async def close(self):
         """Close the HTTP client."""
         await self.client.aclose()
-
-
-class MockCodexClient(CodexClientInterface):
-    """Mock implementation for testing."""
-
-    def __init__(self):
-        self.fixes: Dict[str, FixRecommendation] = {}
-
-    def set_mock_fix(self, key: str, fix: FixRecommendation):
-        """Set a mock fix for testing."""
-        self.fixes[key] = fix
-
-    async def analyze_and_suggest_fix(
-        self,
-        request: CodeAnalysisRequest,
-        model: Optional[str] = None,
-    ) -> FixRecommendation:
-        """Return mock fix recommendation."""
-        # Simple key based on code snippet
-        key = request.code_snippet[:50]
-        if key in self.fixes:
-            return self.fixes[key]
-
-        # Default mock fix
-        return FixRecommendation(
-            diff="@@ -1,3 +1,3 @@\n-old code\n+new code",
-            explanation="This is a mock fix recommendation.",
-            confidence=0.8,
-            affected_files=[request.file_path or "unknown"],
-        )
-
-    async def validate_fix(self, diff: str, context: str) -> bool:
-        """Return mock validation result."""
-        return True

@@ -20,7 +20,6 @@ from app.ticket_center.service import TicketCenterService
 from app.support_ai.service import SupportAIService
 from app.clients.qdrant_client import QdrantClient
 from app.clients.groq_client import GroqClient
-from app.clients.customer_api import CustomerApiClient
 from app.config import settings
 import structlog
 
@@ -161,11 +160,84 @@ class ChatCenterService:
         # Get conversation history
         conversation_history = await self.get_chat_messages(chat_session_id)
 
-        # Initialize Support AI
+        # BUG FIX 1: Route through AIRouter before processing
+        from app.ai_router.classifier import AIRouter
+        from app.clients.qdrant_client import QdrantClient
+        
+        qdrant_client = QdrantClient()
+        router = AIRouter(qdrant_client=qdrant_client)
+        
+        # Classify the message to determine which AI should handle it
+        route_decision = await router.classify(
+            message,
+            attachments or [],
+            customer_id=customer_id,
+            conversation_history=conversation_history,
+        )
+        
+        logger.info(
+            "Chat center routing decision",
+            chat_session_id=chat_session_id,
+            customer_id=customer_id,
+            route=route_decision,
+            message=message[:100],
+        )
+
+        # Route to appropriate AI based on classification
+        if route_decision == "code":
+            # Code AI path - doesn't use tickets
+            from app.code_ai.service import CodeAIService
+            from app.clients.groq_client import GroqClient
+            from app.clients.codex_client import CodexClient
+            from app.code_ai.readers import FileLogReader, GitCodeReader
+            
+            code_ai = CodeAIService(
+                groq_client=GroqClient(),
+                codex_client=CodexClient(),
+                file_reader=FileLogReader(),
+                git_reader=GitCodeReader(),
+            )
+            
+            # Get code AI response
+            code_response = await code_ai.analyze(
+                query=message,
+                customer_data={"customer_id": customer_id},
+            )
+            
+            # Add code AI response to chat
+            await self.add_chat_message(
+                chat_session_id=chat_session_id,
+                sender=MessageSender.CODE_AI,
+                content=code_response.get("response", "I've analyzed your code issue."),
+            )
+            
+            # Mark chat as resolved
+            chat_session.status = ChatSessionStatus.RESOLVED
+            chat_session.updated_at = datetime.now(timezone.utc)
+            
+            return {
+                "action": "resolved",
+                "response": code_response.get("response", "I've analyzed your code issue."),
+                "ticket_id": None,
+                "message_type": "code_analysis"
+            }
+        
+        # Support AI path (default)
+        # Initialize Support AI with optional Gemini client
+        from app.clients.gemini_client import GeminiClient
+        from app.config import settings
+        
+        complex_task_client = None
+        if settings.gemini_api_key:
+            try:
+                complex_task_client = GeminiClient()
+            except Exception as e:
+                logger.warning("Failed to initialize Gemini client, using Groq only", error=str(e))
+        
         support_ai = SupportAIService(
             qdrant_client=QdrantClient(),
             groq_client=GroqClient(),
-            customer_api_client=CustomerApiClient(),
+            complex_task_client=complex_task_client,
         )
 
         # Convert chat messages to ticket messages format for AI processing
@@ -193,6 +265,7 @@ class ChatCenterService:
             ticket_service=None,  # No ticket service yet
             is_agent_request=False,
             conversation_history=ticket_style_messages,
+            product_context=None,  # Chat center doesn't have product context yet
         )
 
         # Check for out-of-scope messages - don't create tickets for these
@@ -253,8 +326,27 @@ class ChatCenterService:
             chat_session.ai_attempts += 1
 
             is_complex = bool(result.get("complexity_analysis", {}).get("is_complex"))
+            
+            # BUG FIX 2: Check if customer says they tried the solution
+            # If they say "I have tried all these" or similar, escalate immediately
+            current_message_lower = message.lower()
+            tried_all_indicators = [
+                "i have tried all these", "i tried all these", "tried everything",
+                "already tried", "didn't work", "not working", "still not working",
+                "still broken", "still failing", "that didn't help"
+            ]
+            customer_tried_all = any(indicator in current_message_lower for indicator in tried_all_indicators)
+            
+            if customer_tried_all:
+                logger.info(
+                    "Customer indicated solution failed - escalating immediately",
+                    chat_session_id=chat_session_id,
+                    message=message,
+                )
+                # Force escalation by setting is_complex to True
+                is_complex = True
 
-            if not is_complex and chat_session.ai_attempts < self.max_ai_attempts:
+            if not is_complex and chat_session.ai_attempts < self.max_ai_attempts and not customer_tried_all:
                 # Still have attempts left - add AI response and continue
                 ai_response = result.get("response") or "I'd like to help you better. Could you provide more details about your issue? For example, what specific error are you seeing or which part of the process isn't working as expected?"
                 await self.add_chat_message(
@@ -300,8 +392,8 @@ class ChatCenterService:
                 ticket = await self._create_ticket_from_chat(
                     chat_session=chat_session,
                     conversation_history=conversation_history,
-                    chat_summary=chat_summary,
                     escalation_reason=escalation_reason,
+                    chat_summary=chat_summary,
                 )
 
                 # Store AI confidence for tracking
@@ -333,8 +425,8 @@ class ChatCenterService:
         self,
         chat_session: ChatSession,
         conversation_history: List[ChatMessage],
-        chat_summary: str,
         escalation_reason: str,
+        chat_summary: str,
     ) -> Ticket:
         """Create a ticket from an escalated chat session."""
         from app.db.models import TicketMessage
@@ -358,8 +450,9 @@ class ChatCenterService:
             path=TicketPath.SUPPORT,
         )
 
-        # Store chat summary
+        # Store chat summary and AI attempts from chat session
         ticket.chat_summary = chat_summary
+        ticket.ai_attempts = chat_session.ai_attempts
 
         # Add remaining messages to ticket
         for msg in conversation_history:
@@ -396,3 +489,38 @@ class ChatCenterService:
             )
         )
         return result.scalar_one_or_none()
+
+    async def reopen_chat_session(self, chat_session_id: str) -> ChatSession:
+        """
+        Reopen a resolved chat session by setting status back to ACTIVE.
+        
+        Args:
+            chat_session_id: The ID of the chat session to reopen
+            
+        Returns:
+            The updated chat session
+            
+        Raises:
+            ValueError: If the chat session is not found or is not in RESOLVED status
+        """
+        chat_session = await self.get_chat_session(chat_session_id)
+        if not chat_session:
+            raise ValueError(f"Chat session {chat_session_id} not found")
+            
+        if chat_session.status != ChatSessionStatus.RESOLVED:
+            raise ValueError(
+                f"Cannot reopen chat session {chat_session_id} with status {chat_session.status}. "
+                "Only RESOLVED sessions can be reopened."
+            )
+        
+        # Reopen the session
+        chat_session.status = ChatSessionStatus.ACTIVE
+        chat_session.updated_at = datetime.now(timezone.utc)
+        
+        logger.info(
+            "Reopened resolved chat session",
+            chat_session_id=chat_session_id,
+            customer_id=chat_session.customer_id,
+        )
+        
+        return chat_session

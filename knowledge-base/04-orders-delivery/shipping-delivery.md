@@ -13,7 +13,7 @@ confidence: medium
 
 ## Customer guidance
 
-The storefront says Sidai Artistry ships internationally from East Africa. In-stock pieces are normally prepared within 2–4 business days; handcrafted or custom work may take longer and should be confirmed before dispatch. Tracking details are shared after dispatch. The recipient is responsible for applicable international duties and local taxes.
+The storefront says Shiva Softwares ships internationally from East Africa. In-stock pieces are normally prepared within 2–4 business days; handcrafted or custom work may take longer and should be confirmed before dispatch. Tracking details are shared after dispatch. The recipient is responsible for applicable international duties and local taxes.
 
 ## How delivery selection works
 
