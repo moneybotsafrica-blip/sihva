@@ -2028,8 +2028,11 @@ async def test_groq_analysis(request: Request):
             logger.info("Vague issue detected - gathering more details first", message=message)
 
         # Additional check: don't create tickets for simple greetings even if AI suggests queueing
-        simple_greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "thanks", "thank you", "bye", "goodbye"]
-        is_simple_greeting = any(greeting in message.lower() for greeting in simple_greetings)
+        simple_greetings = {
+            "hi", "hello", "hey", "good morning", "good afternoon", "good evening",
+            "thanks", "thank you", "bye", "goodbye",
+        }
+        is_simple_greeting = message.strip().lower() in simple_greetings
 
         # Check for staff-only issues that should always be escalated
         staff_only_indicators = [
